@@ -1,0 +1,35 @@
+[package]
+name = "unchecked-io"
+version = "0.1.0"
+authors = ['billthemaker']
+license = "MIT OR Apache-2.0"
+edition = "2024"
+
+[lib]
+
+name = "unchecked_io"
+
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# 1. Python Bindings for FFI
+pyo3 = { version = "0.20", features = ["extension-module"] }
+
+# 2. Configuration Parsing
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+
+# 3. Apache Arrow
+arrow = "57.0.0"
+
+# 4. Asynchronous Runtime
+tokio = { version = "1.48.0", features = ["full"] }
+
+# 5. DB Connection (Postgres)
+tokio-postgres = "0.7.15"
+anyhow = "1.0.100"
+futures-util = "0.3.31"
+bytes = "1.11.0"
+byteorder = "1.5.0"
+chrono = "0.4"
+uuid = { version = "1.8", features = ["serde", "v4"] }
