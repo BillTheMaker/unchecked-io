@@ -3,13 +3,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio_postgres::{NoTls, CopyOutStream};
 use anyhow::{Context, Result, anyhow};
-// FIX: Import new builders
 use arrow::array::{
     ArrayBuilder, ArrayRef,
     Int64Builder, Float64Builder, Float32Builder, StringBuilder, BooleanBuilder,
     TimestampNanosecondBuilder, Date32Builder, Int32Builder
 };
-// FIX: Import new types
 use arrow::datatypes::{
     DataType, Field, Schema,
     Float64Type, Float32Type, Int64Type, Int32Type, Utf8Type, BooleanType, TimestampNanosecondType,
@@ -28,7 +26,8 @@ use crate::config::ConnectorConfig;
 
 
 // --- 1. CORE DATABASE LOGIC ---
-pub async fn run_db_logic(config: ConnectorConfig) -> Result<()> {
+// FIX: Change return type from Result<()> to Result<RecordBatch>
+pub async fn run_db_logic(config: ConnectorConfig) -> Result<RecordBatch> {
     // 1. Establish the connection
     println!("UncheckedIO: Attempting connection...");
 
@@ -42,7 +41,6 @@ pub async fn run_db_logic(config: ConnectorConfig) -> Result<()> {
     });
 
     // 2. Execute the COPY TO STDOUT command
-    // FIX: We are now using the query from the config file!
     let copy_query = &config.query;
     println!("UncheckedIO: Executing user-defined query...");
 
@@ -54,18 +52,17 @@ pub async fn run_db_logic(config: ConnectorConfig) -> Result<()> {
 
     // Build the Arrow Schema from the config
     let schema_fields: Vec<Field> = config.schema.iter().map(|col_cfg| {
-        // We now allow "nullable" to be controlled by the column name, a temporary "hack"
         let nullable = col_cfg.column_name == "notes";
 
         let arrow_type = match col_cfg.arrow_type.as_str() {
             "Int64" => DataType::Int64,
-            "Int32" => DataType::Int32, // NEW
-            "Float64" => DataType::Float64, // NEW
+            "Int32" => DataType::Int32,
+            "Float64" => DataType::Float64,
             "Float32" => DataType::Float32,
             "Utf8" | "String" => DataType::Utf8,
             "Boolean" => DataType::Boolean,
             "Timestamp(Nanosecond, None)" => DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
-            "Date32" => DataType::Date32, // NEW
+            "Date32" => DataType::Date32,
             _ => panic!("Unsupported type in config: {}", col_cfg.arrow_type),
         };
         Field::new(&col_cfg.column_name, arrow_type, nullable)
@@ -82,7 +79,9 @@ pub async fn run_db_logic(config: ConnectorConfig) -> Result<()> {
              record_batch.num_rows(), record_batch.num_columns());
 
     println!("UncheckedIO: Data transfer complete. We lived.");
-    Ok(())
+
+    // FIX: Return the finished RecordBatch
+    Ok(record_batch)
 }
 
 
@@ -91,13 +90,13 @@ pub async fn run_db_logic(config: ConnectorConfig) -> Result<()> {
 // This enum will hold our different builder types
 enum DynamicBuilder {
     Int64(Box<Int64Builder>),
-    Int32(Box<Int32Builder>), // NEW
-    Float64(Box<Float64Builder>), // NEW
+    Int32(Box<Int32Builder>),
+    Float64(Box<Float64Builder>),
     Float32(Box<Float32Builder>),
     String(Box<StringBuilder>),
     Boolean(Box<BooleanBuilder>),
     Timestamp(Box<TimestampNanosecondBuilder>),
-    Date32(Box<Date32Builder>), // NEW
+    Date32(Box<Date32Builder>),
 }
 
 // Postgres Epoch for timestamps
