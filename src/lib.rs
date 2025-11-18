@@ -6,7 +6,7 @@ mod parser;
 use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
 use tokio;
-use pyo3::types::PyModule;
+use pyo3::types::{PyModule, PyAny}; // Added PyAny
 use pyo3::Bound;
 
 // FIX 1: Import PyRecordBatch.
@@ -24,7 +24,14 @@ use crate::parser::run_db_logic;
 #[allow(unsafe_code)]
 #[allow(unsafe_op_in_unsafe_fn)]
 #[allow(rust_2024_compatibility)]
-fn load_data_from_config<'py>(py: Python<'py>, config_path: String) -> PyResult<Bound<'py, PyAny>> {
+// FIX 2: Updated signature to accept 'blast_radius' and return 'Bound<'py, PyAny>'
+// This matches what you confirmed works with .into_pyarrow(py).
+fn load_data_from_config<'py>(
+    py: Python<'py>,
+    config_path: String,
+    blast_radius: i64
+) -> PyResult<Bound<'py, PyAny>> {
+
     // --- Phase 1: Load and Validate Configuration ---
     let config: ConnectorConfig = match load_and_validate_config(&config_path) {
         Ok(c) => c,
@@ -42,26 +49,26 @@ fn load_data_from_config<'py>(py: Python<'py>, config_path: String) -> PyResult<
             .build()
             .unwrap()
             .block_on(async {
-                run_db_logic(config).await
+                // FIX 3: Pass the 'blast_radius' argument to the parser logic
+                run_db_logic(config, blast_radius).await
             })
     }).map_err(|e| PyValueError::new_err(format!("Database/Runtime Error: {:?}", e)))?;
 
     // --- Phase 3: Return Data to Python ---
-    // FIX 2: Create PyRecordBatch wrapper using the standard PyO3 __new__ convention.
-    // let py_record_batch = PyRecordBatch::new(record_batch);
-    // // Replace: let py_record_batch = PyRecordBatch::new(py, record_batch).map_err(|e| ...)?;
-    // // With:
+
+    // Create the wrapper. .new() takes one argument in this version.
     let py_record_batch = PyRecordBatch::new(record_batch);
-    // Return the PyRecordBatch wrapper object as a generic PyObject reference.
+
+    // Call the correct conversion method which returns PyResult<Bound<'py, PyAny>>
     py_record_batch.into_pyarrow(py)
 }
 
 
 // --- PYTHON MODULE EXPORT ---
+
 #[pymodule]
 fn unchecked_io(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // FIX: Use the two-argument version of wrap_pyfunction!
-    // This resolves the E0308 type mismatch.
+    // FIX 4: Use the two-argument wrap_pyfunction! macro pattern which you confirmed works.
     m.add_function(wrap_pyfunction!(load_data_from_config, m)?)?;
 
     Ok(())

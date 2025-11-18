@@ -15,6 +15,9 @@ DB_HOST = "localhost"
 DB_PORT = "5433" # <-- Your local Docker port
 DB_NAME = "postgres"
 
+# Global Configuration
+BLAST_RADIUS = 625000 # Rows per parallel task (1M / 62500 = 16 partitions)
+
 # SQLAlchemy connection string (for Pandas)
 sqlalchemy_conn_str = f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 engine = sqlalchemy.create_engine(sqlalchemy_conn_str)
@@ -62,12 +65,14 @@ def test_connectorx():
     return df
 
 def test_unchecked_io():
-    arrow_table = unchecked_io.load_data_from_config(config_file)
+    # FIX: Pass the BLAST_RADIUS argument
+    arrow_table = unchecked_io.load_data_from_config(config_file, BLAST_RADIUS)
     return arrow_table
 
 # --- 4. Run Benchmarks ---
 run_count = 3
-print(f"Running benchmarks for 1,000,000 rows (average of {run_count} runs)...")
+print(f"Running benchmarks for 5,000,000 rows (average of {run_count} runs)...")
+print(f"Blast Radius: {BLAST_RADIUS} rows per task")
 
 # --- Pandas ---
 print("\nRunning Pandas warmup...")
@@ -92,7 +97,7 @@ print(f"UncheckedIO Average Time: {unchecked_io_time * 1000:.2f} ms")
 
 # --- 5. Print Results ---
 print("\n" + "---" * 10)
-print("--- Benchmark Results (1,000,000 Rows) ---")
+print("--- Benchmark Results (5,000,000 Rows) ---")
 print(f"Pandas:       {pandas_time * 1000:>10.2f} ms")
 print(f"ConnectorX:   {connectorx_time * 1000:>10.2f} ms")
 print(f"UncheckedIO:  {unchecked_io_time * 1000:>10.2f} ms")
