@@ -1,0 +1,127 @@
+# Project: UncheckedIO (f.k.a. BlitzPipe, YOLO-Pipe)
+
+Date: 2025-11-17
+
+Status: MVP functional, performance-tuning phase.
+
+## 1. Project Philosophy & Goal
+
+The primary goal of `UncheckedIO` is to create the fastest possible data connector for bulk-loading data from a PostgreSQL database directly into a Python/Arrow environment.
+
+The core philosophy is the **"Configured Opinion"**:
+
+1. **The Problem:** Generic connectors (like `pandas.read_sql` or even `ConnectorX`) must be flexible. They spend significant CPU time at runtime discovering the database schema, validating data types, and converting them (a "schema-on-read" approach).
+
+2. **Our Solution:** We trade this flexibility for raw speed. Our library is **opinionated**. We _require_ the user to provide the exact query and schema in a `config.yaml` file.
+
+3. **The "Unchecked" Joke:** The name `UncheckedIO` (a reference to Java's `UncheckedIOException`) is a tongue-in-cheek warning. We are "unchecked" because we **trust the user's config completely** and skip the expensive runtime validation, allowing us to build a hyper-optimized binary parser. The Rust compiler provides the _memory_ safety; the user provides the _schema_ safety.
+
+
+## 2. Core Architectural Decisions
+
+### Stack
+
+- **Core Language:** Rust. Chosen for its C-level performance, memory safety (Borrow Checker), and powerful async capabilities.
+
+- **Interface:** Python. We are building a native Python module so data scientists can get this speed without learning Rust.
+
+- **Python Bridge:** `PyO3` (for bindings) and `Maturin` (for building/packaging).
+
+- **Async Runtime:** `Tokio`. The industry standard for high-performance, asynchronous I/O in Rust.
+
+- **Data Format:** `Apache Arrow`. This is the standard for zero-copy, columnar data. We parse directly from the database stream into Arrow `RecordBatch` objects.
+
+- **Error Handling:** `anyhow`. Chosen for its simplicity in application-level error handling, especially for wrapping and propagating errors across thread boundaries (`Send + 'static`).
+
+
+### Project Structure (Idiomatic Rust)
+
+The project was refactored from a single `lib.rs` file into a modular structure:
+
+- `src/lib.rs`: The "front door." Contains only the `#[pyfunction]` and `#[pymodule]` definitions. This is the FFI (Foreign Function Interface) layer.
+
+- `src/config.rs`: Handles all logic for parsing and validating the user's `config.yaml` file. Defines the `ConnectorConfig` struct.
+
+- `src/parser.rs`: The "engine." Contains all core logic: connecting to Postgres, running the query, and parsing the binary stream.
+
+
+### Data Flow (The "Fast Path")
+
+1. **User Config:** The user provides a `config.yaml` with their `connection_string`, an ordered `schema` (as a `Vec`), and the exact `query`.
+
+2. **Query Type:** The `query` _must_ be a PostgreSQL `COPY ... TO STDOUT (FORMAT binary)` command. This bypasses the slow row-by-row SQL protocol and uses Postgres's high-speed bulk export stream.
+
+3. **Stream Handling:** We use `tokio-postgres`'s `client.copy_out()` function to get the raw `CopyOutStream`.
+
+4. **Parser:** The `handle_binary_copy` function iterates this stream, parses the binary format (header, row-by-row field data, and trailer), and appends values directly into the correct Arrow `ArrayBuilder` based on the user's config.
+
+
+## 3. Key Challenges & Debugging History (Critical Context)
+
+This section is vital, as it documents the non-obvious fixes required to make the project compile.
+
+### FFI (Python <-> Rust) Hell
+
+We spent ~15 iterations debugging the FFI (Foreign Function Interface) to return the `RecordBatch` to Python.
+
+- **Problem:** Mismatched versions of `pyo3` (v0.27.1) and `pyo3-arrow` (v0.15.0) led to confusing compiler errors.
+
+- **Failed Attempts:** `ArrowIntoPy` was unresolved. `PyArrowConvert` was unresolved. `PyRecordBatch::new` had the wrong signature. `m.add_function` had constant E0277 (trait bound) and E0061 (argument count) errors.
+
+- **Final Working Syntax (The "Magic Incantation"):**
+
+    - **`src/lib.rs` (Return):** The function _must_ return a `Bound` reference:
+
+        ```
+        fn load_data_from_config<'py>(py: Python<'py>, ...) -> PyResult<Bound<'py, PyAny>>
+        ```
+
+    - **`src/lib.rs` (Conversion):** The `RecordBatch` must be wrapped in `PyRecordBatch` and converted using the `into_pyarrow(py)` method:
+
+        ```
+        let py_record_batch = PyRecordBatch::new(record_batch);
+        py_record_batch.into_pyarrow(py)
+        ```
+
+    - **`src/lib.rs` (Module):** The `wrap_pyfunction!` macro _must_ take the module `m` as a second argument to resolve the trait bounds:
+
+        ```
+        m.add_function(wrap_pyfunction!(load_data_from_config, m)?)?;
+        ```
+
+
+## 4. Current Status & Next Steps
+
+- **Status:** **MVP Complete.** The library successfully:
+
+    1. Installs in Colab from GitHub.
+
+    2. Installs a local Postgres server.
+
+    3. Populates a 1,000,000 row, 10-column table.
+
+    4. Runs a benchmark via `timeit`.
+
+- **Benchmark Results (1M Rows):**
+
+    - `Pandas`: ~7800 ms
+
+    - `ConnectorX`: ~3400 ms
+
+    - `UncheckedIO`: ~3450 ms
+
+- **Diagnosis:** We are **tying** the #1 competitor, not beating them. This is because our parser is **inefficient**.
+
+- **The Bottleneck:** `handle_binary_copy` aggregates the _entire_ 130MB+ byte stream into a single `Vec<u8>` in memory _before_ it starts parsing. This is a **batch processor**. ConnectorX is almost certainly a **streaming processor**.
+
+- Next Step (The Real Optimization):
+
+    Refactor handle_binary_copy to be a true streaming parser. We must move the parsing logic (the Cursor) inside the while let Some(segment) = stream.next().await loop. This will involve:
+
+    1. Parsing the small `segment` (e.g., 64kB) chunk.
+
+    2. Handling partial rows (when a row's data is split between two chunks).
+
+    3. Appending to the Arrow builders in real-time.
+
+        This will dramatically reduce memory overhead and should make us significantly faster than ConnectorX.
