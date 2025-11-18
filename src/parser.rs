@@ -1,104 +1,213 @@
 // --- External Crates ---
-use std::pin::Pin;
+use std::pin::Pin; 
 use std::sync::Arc;
-use tokio_postgres::{NoTls, CopyOutStream};
-use anyhow::{Context, Result, anyhow};
+use tokio_postgres::{NoTls, CopyOutStream, Client, Config as PgConfig}; // FIX: Import Client and PgConfig
+use anyhow::{Context, Result, anyhow}; 
 use arrow::array::{
-    ArrayBuilder, ArrayRef,
+    ArrayBuilder, ArrayRef, 
     Int64Builder, Float64Builder, Float32Builder, StringBuilder, BooleanBuilder,
     TimestampNanosecondBuilder, Date32Builder, Int32Builder
-};
+}; 
 use arrow::datatypes::{
-    DataType, Field, Schema,
+    DataType, Field, Schema, 
     Float64Type, Float32Type, Int64Type, Int32Type, Utf8Type, BooleanType, TimestampNanosecondType,
     Date32Type
-};
+}; 
 use arrow::record_batch::RecordBatch;
-use futures_util::stream::StreamExt;
+use futures_util::stream::StreamExt; 
 use bytes::Bytes;
 use byteorder::{BigEndian, ReadBytesExt};
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read}; 
 use std::str;
 use chrono::{NaiveDateTime, NaiveDate};
-use std::mem; // <-- We need this for mem::take
+use std::mem; 
+use std::str::FromStr; // FIX: Import FromStr for PgConfig
+use tokio::task::JoinSet; // FIX: Import JoinSet for parallelism
+use arrow::compute::concat_batches; // FIX: Import the final stitching function
 
 // --- Internal Crates ---
-use crate::config::ConnectorConfig;
+use crate::config::ConnectorConfig; 
 
 
-// --- 1. CORE DATABASE LOGIC (Public API) ---
-// This function remains unchanged.
+// --- 1. CORE DATABASE LOGIC (REFACTORED TO A *PARALLEL COORDINATOR*) ---
 pub async fn run_db_logic(config: ConnectorConfig) -> Result<RecordBatch> {
-    // 1. Establish the connection
-    println!("UncheckedIO: Attempting connection...");
-
-    let (client, connection) = tokio_postgres::connect(&config.connection_string, NoTls).await
-        .context("Failed to connect to PostgreSQL database")?;
-
+    
+    // --- Phase 1: Task 1-3 (Query Planner) ---
+    println!("UncheckedIO: Starting Query Planner...");
+    
+    // 1. Establish the *coordinator* connection
+    // FIX: Parse the connection string into a config we can clone for workers
+    let pg_config = PgConfig::from_str(&config.connection_string)?;
+    
+    let (client, connection) = pg_config.connect(NoTls).await
+        .context("Coordinator: Failed to connect to PostgreSQL")?;
+    
     tokio::spawn(async move {
         if let Err(e) = connection.await {
-            eprintln!("Postgres connection error: {}", e);
+            eprintln!("Coordinator connection error: {}", e);
         }
     });
 
-    // 2. Execute the COPY TO STDOUT command
-    let copy_query = &config.query;
-    println!("UncheckedIO: Executing user-defined query...");
+    // 2. Define Partition Strategy (Task 3)
+    let num_partitions = num_cpus::get().max(2); // Use all cores, but at least 2
+    let partition_key = "id"; // Task 1: Hardcode partition key
 
-    let copy_stream = client.copy_out(copy_query.as_str()).await
-        .context("Failed to execute COPY TO STDOUT protocol. Check your query syntax and permissions.")?;
+    // 3. Query for Table Bounds (Task 2)
+    let (base_query, _) = config.query
+        .trim()
+        .split_once("TO STDOUT (FORMAT binary)")
+        .context("Failed to parse base query from config")?;
+    
+    // We need just the table/query part, remove the COPY (...)
+    let base_query_inner = base_query.trim().trim_start_matches("COPY (").trim_end_matches(")");
+    
+    let stats_query = format!(
+        "SELECT MIN({}), MAX({}), COUNT(*) FROM ({}) AS subquery",
+        partition_key, partition_key, base_query_inner
+    );
+    
+    println!("UncheckedIO: Running stats query: {}", stats_query);
+    let row = client.query_one(&stats_query, &[]).await?;
+    let min_id: i64 = row.try_get(0).context("Failed to get MIN(id)")?;
+    let max_id: i64 = row.try_get(1).context("Failed to get MAX(id)")?;
+    let count: i64 = row.try_get(2).context("Failed to get COUNT(*)")?;
+    
+    if count == 0 {
+        // Return an empty, valid RecordBatch
+        println!("UncheckedIO: Table has no rows (COUNT=0). Returning empty batch.");
+        let arrow_schema = build_arrow_schema(&config)?;
+        return Ok(RecordBatch::new_empty(arrow_schema));
+    }
 
-    // 3. Handle the Binary Stream
-    let pinned_stream: Pin<Box<CopyOutStream>> = Box::pin(copy_stream);
+    let chunk_size = (count as f64 / num_partitions as f64).ceil() as i64;
+    println!("UncheckedIO: Found {} rows. Creating {} partitions of ~{} rows each.", count, num_partitions, chunk_size);
+    
+    // --- Phase 1: Task 4 (Generate Partitioned Queries) ---
+    let mut partition_queries: Vec<String> = Vec::new();
+    for i in 0..num_partitions {
+        let part_min = min_id + (i as i64 * chunk_size);
+        let part_max = (part_min + chunk_size - 1).min(max_id);
 
-    // Build the Arrow Schema from the config
+        if part_min > max_id {
+            break; 
+        }
+        
+        // Construct the new, partitioned query
+        let new_query = format!(
+            "COPY (SELECT * FROM ({}) AS sub WHERE {} BETWEEN {} AND {}) TO STDOUT (FORMAT binary)",
+            base_query_inner,
+            partition_key,
+            part_min,
+            part_max
+        );
+        partition_queries.push(new_query);
+    }
+
+    println!("UncheckedIO: Generated {} parallel queries.", partition_queries.len());
+
+    // --- Phase 2: Tasks 5-9 (Parallel Execution) ---
+    
+    // Build the Arrow Schema *once* and wrap it in an Arc so it can be cloned cheaply
+    let arrow_schema = Arc::new(build_arrow_schema(&config)?);
+    
+    // Task 5: Spawn Tokio Tasks
+    let mut join_set = JoinSet::new();
+
+    for query in partition_queries {
+        let worker_pg_config = pg_config.clone(); // Clone config for the new task
+        let worker_schema = arrow_schema.clone(); // Clone Arc (cheap) for the new task
+
+        join_set.spawn(async move {
+            // Task 6: Isolate Worker Connections
+            let (worker_client, worker_connection) = worker_pg_config.connect(NoTls).await?;
+            
+            // Spawn the connection task for this worker
+            tokio::spawn(async move {
+                if let Err(e) = worker_connection.await {
+                    eprintln!("Worker connection error: {}", e);
+                }
+            });
+
+            // Task 7: Execute Partition in Parallel
+            let copy_stream = worker_client.copy_out(query.as_str()).await?;
+            let pinned_stream: Pin<Box<CopyOutStream>> = Box::pin(copy_stream); 
+
+            // Call our existing streaming parser!
+            let record_batch = parse_binary_stream(pinned_stream, worker_schema).await?;
+            
+            // Return the finished batch
+            Ok::<_, anyhow::Error>(record_batch)
+        });
+    }
+
+    // --- Phase 3: Task 8 (Collect and Concatenate Results) ---
+    let mut batches: Vec<RecordBatch> = Vec::new();
+    while let Some(join_result) = join_set.join_next().await {
+        match join_result {
+            Ok(batch_result) => {
+                match batch_result {
+                    Ok(batch) => {
+                        if batch.num_rows() > 0 {
+                            batches.push(batch);
+                        }
+                    },
+                    Err(e) => return Err(anyhow!("A worker task failed: {}", e)),
+                }
+            },
+            Err(e) => return Err(anyhow!("A tokio task failed to join: {}", e)),
+        }
+    }
+    
+    if batches.is_empty() {
+        println!("UncheckedIO: All partitions returned empty. Returning empty batch.");
+        return Ok(RecordBatch::new_empty(arrow_schema));
+    }
+
+    // Task 8: Stitch all the RecordBatches together into one
+    let final_batch = concat_batches(&batches[0].schema(), &batches)?
+        .context("Failed to concatenate parallel batches")?;
+
+    Ok(final_batch)
+}
+
+/// Helper function to build the Arrow Schema from the config
+fn build_arrow_schema(config: &ConnectorConfig) -> Result<Schema> {
     let schema_fields: Vec<Field> = config.schema.iter().map(|col_cfg| {
         let nullable = col_cfg.column_name == "notes";
 
         let arrow_type = match col_cfg.arrow_type.as_str() {
             "Int64" => DataType::Int64,
-            "Int32" => DataType::Int32,
-            "Float64" => DataType::Float64,
+            "Int32" => DataType::Int32, 
+            "Float64" => DataType::Float64, 
             "Float32" => DataType::Float32,
             "Utf8" | "String" => DataType::Utf8,
             "Boolean" => DataType::Boolean,
             "Timestamp(Nanosecond, None)" => DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
-            "Date32" => DataType::Date32,
-            _ => panic!("Unsupported type in config: {}", col_cfg.arrow_type),
+            "Date32" => DataType::Date32, 
+            _ => return Err(anyhow!("Unsupported type in config: {}", col_cfg.arrow_type)),
         };
-        Field::new(&col_cfg.column_name, arrow_type, nullable)
-    }).collect();
-    let arrow_schema = Arc::new(Schema::new(schema_fields));
+        Ok(Field::new(&col_cfg.column_name, arrow_type, nullable))
+    }).collect::<Result<Vec<Field>>>()?; // Collect the results, propagating errors
 
-    // Call the parser
-    // We pass the schema and get back the final RecordBatch
-    let record_batch = parse_binary_stream(pinned_stream, arrow_schema.clone()).await?;
-
-    println!("UncheckedIO: Successfully parsed {} rows via binary stream.", record_batch.num_rows());
-
-    // 4. Final Output Confirmation
-    println!("UncheckedIO: Built RecordBatch with {} rows and {} columns.",
-             record_batch.num_rows(), record_batch.num_columns());
-
-    println!("UncheckedIO: Data transfer complete. We lived.");
-
-    Ok(record_batch)
+    Ok(Schema::new(schema_fields))
 }
 
 
 // --- 2. INTERNAL PARSER IMPLEMENTATION ---
-// All the complex logic is now contained in this private section.
+// This section (parse_binary_stream, parse_stream_header, parse_row)
+// remains 100% UNCHANGED from our Sprint 2.
+// It is now the "worker" logic that will be called by our parallel tasks.
 
 // This enum will hold our different builder types
 enum DynamicBuilder {
     Int64(Box<Int64Builder>),
-    Int32(Box<Int32Builder>),
-    Float64(Box<Float64Builder>),
+    Int32(Box<Int32Builder>), 
+    Float64(Box<Float64Builder>), 
     Float32(Box<Float32Builder>),
     String(Box<StringBuilder>),
-    Boolean(Box<BooleanBuilder>),
-    Timestamp(Box<TimestampNanosecondBuilder>),
-    Date32(Box<Date32Builder>),
+    Boolean(Box<BooleanBuilder>), 
+    Timestamp(Box<TimestampNanosecondBuilder>), 
+    Date32(Box<Date32Builder>), 
 }
 
 // Postgres Epoch for timestamps
@@ -106,13 +215,13 @@ const POSTGRES_EPOCH_NAIVE: NaiveDateTime = NaiveDate::from_ymd_opt(2000, 1, 1).
 // Unix Epoch for dates
 const UNIX_EPOCH_NAIVE_DATE: NaiveDate = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
 
-/// This is the refactored streaming state machine.
-/// It reads the stream chunk by chunk and parses it.
+/// This is the streaming "worker" function.
+/// It reads a stream chunk by chunk and parses it.
 async fn parse_binary_stream(
-    mut stream: Pin<Box<CopyOutStream>>,
+    mut stream: Pin<Box<CopyOutStream>>, 
     arrow_schema: Arc<Schema>
 ) -> Result<RecordBatch> {
-
+    
     // --- Phase 1: Task 1 (Initialize Builders) ---
     let mut builders: Vec<DynamicBuilder> = arrow_schema.fields().iter().map(|field| {
         match field.data_type() {
@@ -121,9 +230,9 @@ async fn parse_binary_stream(
             DataType::Float64 => DynamicBuilder::Float64(Box::new(Float64Builder::new())),
             DataType::Float32 => DynamicBuilder::Float32(Box::new(Float32Builder::new())),
             DataType::Utf8 => DynamicBuilder::String(Box::new(StringBuilder::new())),
-            DataType::Boolean => DynamicBuilder::Boolean(Box::new(BooleanBuilder::new())),
+            DataType::Boolean => DynamicBuilder::Boolean(Box::new(BooleanBuilder::new())), 
             DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None) => {
-                DynamicBuilder::Timestamp(Box::new(TimestampNanosecondBuilder::new()))
+                DynamicBuilder::Timestamp(Box::new(TimestampNanosecondBuilder::new())) 
             },
             DataType::Date32 => DynamicBuilder::Date32(Box::new(Date32Builder::new())),
             _ => panic!("Unsupported type in builder creation!"), // Will improve later
@@ -134,25 +243,21 @@ async fn parse_binary_stream(
     let mut leftover_buffer: Vec<u8> = Vec::new();
     let mut is_header_parsed: bool = false;
     let mut rows_processed: usize = 0;
-
+    
     // --- Phase 2: Task 4 (Streaming Loop) ---
-    'stream_loop: while let Some(segment_result) = stream.next().await {
+    'stream_loop: while let Some(segment_result) = stream.next().await { 
         let segment: Bytes = segment_result.context("Error reading segment from CopyOutStream")?;
-
-        // Combine leftover bytes from last chunk with the new chunk
-        let mut current_chunk: Vec<u8> = mem::take(&mut leftover_buffer);
+        
+        let mut current_chunk: Vec<u8> = mem::take(&mut leftover_buffer); 
         current_chunk.extend_from_slice(&segment);
-
-        // --- Phase 2: Task 5 (Create Cursor) ---
+        
         let mut cursor = Cursor::new(&current_chunk[..]);
 
         // --- Phase 2: Task 6 (Handle Header) ---
         if !is_header_parsed {
-            // Check if we have enough bytes for the header (11 + 4 + 4 = 19 bytes)
             if current_chunk.len() < 19 {
-                // Not enough data. Move the chunk back and wait for more.
                 leftover_buffer = current_chunk;
-                continue 'stream_loop; // Get next segment
+                continue 'stream_loop; 
             }
 
             parse_stream_header(&mut cursor)?;
@@ -161,61 +266,44 @@ async fn parse_binary_stream(
 
         // --- Phase 3: Tasks 7-9 (Inner Parsing Loop) ---
         'parsing_loop: loop {
-            // --- Task 8: Implement Safe Read (Row Level) ---
-            // Save state before attempting to read a row's header
             let safe_position = cursor.position();
 
             // 1. Try to read the 2-byte row header (column count)
             let col_count = match cursor.read_i16::<BigEndian>() {
                 Ok(count) => count,
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    // This is NOT an error. It's a partial read.
-                    // We don't have enough data for a full row header.
-                    // Rewind the cursor to the safe position...
                     cursor.set_position(safe_position);
-                    // ... and save the remaining bytes for the next chunk.
                     leftover_buffer.extend_from_slice(&current_chunk[safe_position as usize..]);
-                    // Break the *inner* loop to get the next network segment
                     break 'parsing_loop;
                 }
-                Err(e) => return Err(e.into()), // This is a real, unexpected error
+                Err(e) => return Err(e.into()), 
             };
 
-            // --- Task 10: Verify Stream Trailer ---
+            // 2. Check for end-of-stream trailer
             if col_count == -1 {
-                println!("UncheckedIO: Reached end-of-stream trailer.");
-                leftover_buffer.clear(); // We are done, clear any remaining bytes
+                println!("UncheckedIO: Worker reached end-of-stream trailer.");
+                leftover_buffer.clear(); 
                 break 'stream_loop; // Break the *outer* loop
             }
 
             // 3. Try to parse all fields for this row
             match parse_row(&mut cursor, &mut builders, &current_chunk) {
                 Ok(_) => {
-                    // Row was parsed successfully
                     rows_processed += 1;
                 }
-                // FIX: 'e' is already a std::io::Error. We just check its .kind() directly.
-                // This resolves the E0599 (method not found) errors.
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    // This was a partial row. The error is expected.
-                    // Rewind to the start of the row.
+                Err(e) if e.is::<std::io::Error>() && e.downcast_ref::<std::io::Error>().unwrap().kind() == std::io::ErrorKind::UnexpectedEof => {
                     cursor.set_position(safe_position);
                     leftover_buffer.extend_from_slice(&current_chunk[safe_position as usize..]);
                     break 'parsing_loop;
                 }
                 Err(e) => {
-                    // This was a real, unexpected error.
-                    // FIX: Convert the std::io::Error into an anyhow::Error.
-                    // This resolves the E0308 (mismatched types) error.
-                    return Err(e.into());
+                    return Err(e);
                 }
             }
         } // End inner 'parsing_loop
     } // End outer 'stream_loop
-
-    // --- Phase 1: Task 3 (Refactor Finalization) ---
+    
     if !leftover_buffer.is_empty() {
-        // We should have broken on the trailer. If we have leftovers, something is wrong.
         return Err(anyhow!("Stream ended with leftover bytes ({}) but no trailer. Data is corrupt.", leftover_buffer.len()));
     }
 
@@ -227,23 +315,22 @@ async fn parse_binary_stream(
             DynamicBuilder::Float64(mut b) => Arc::new(b.finish()) as ArrayRef,
             DynamicBuilder::Float32(mut b) => Arc::new(b.finish()) as ArrayRef,
             DynamicBuilder::String(mut b) => Arc::new(b.finish()) as ArrayRef,
-            DynamicBuilder::Boolean(mut b) => Arc::new(b.finish()) as ArrayRef,
+            DynamicBuilder::Boolean(mut b) => Arc::new(b.finish()) as ArrayRef, 
             DynamicBuilder::Timestamp(mut b) => Arc::new(b.finish()) as ArrayRef,
             DynamicBuilder::Date32(mut b) => Arc::new(b.finish()) as ArrayRef,
         }
     }).collect();
-
+    
     // Build the Final RecordBatch
     let record_batch = RecordBatch::try_new(
         arrow_schema.clone(),
         final_columns,
     ).context("Failed to create final Arrow RecordBatch")?;
-
+    
     Ok(record_batch)
 }
 
 /// Helper function to parse the 19-byte Postgres binary header.
-/// This advances the cursor.
 fn parse_stream_header(cursor: &mut Cursor<&[u8]>) -> Result<()> {
     let mut magic_signature = [0u8; 11];
     cursor.read_exact(&mut magic_signature).context("Failed to read magic signature")?;
@@ -252,25 +339,22 @@ fn parse_stream_header(cursor: &mut Cursor<&[u8]>) -> Result<()> {
     }
     let _flags = cursor.read_u32::<BigEndian>().context("Failed to read flags")?;
     let _header_ext_len = cursor.read_u32::<BigEndian>().context("Failed to read header extension length")?;
-
+    
     println!("UncheckedIO: Postgres binary header validated.");
     Ok(())
 }
 
 /// Helper function to parse one full row of data from the cursor.
-/// This function is designed to fail with an `UnexpectedEof` error if the row is partial,
-/// allowing the outer loop to handle it.
 fn parse_row(
-    cursor: &mut Cursor<&[u8]>,
-    builders: &mut [DynamicBuilder],
+    cursor: &mut Cursor<&[u8]>, 
+    builders: &mut [DynamicBuilder], 
     current_chunk: &[u8] // Needed for partial string reads
 ) -> Result<(), std::io::Error> { // Returns a specific IO Error
-
+    
     for (i, builder) in builders.iter_mut().enumerate() {
         // 1. Read field length (4 bytes)
-        // This will propagate the UnexpectedEof error up if it fails
-        let field_len_i32 = cursor.read_i32::<BigEndian>()?;
-
+        let field_len_i32 = cursor.read_i32::<BigEndian>()?; 
+        
         if field_len_i32 == -1 {
             // Handle NULLs
             match builder {
@@ -279,7 +363,7 @@ fn parse_row(
                 DynamicBuilder::Float64(b) => b.append_null(),
                 DynamicBuilder::Float32(b) => b.append_null(),
                 DynamicBuilder::String(b) => b.append_null(),
-                DynamicBuilder::Boolean(b) => b.append_null(),
+                DynamicBuilder::Boolean(b) => b.append_null(), 
                 DynamicBuilder::Timestamp(b) => b.append_null(),
                 DynamicBuilder::Date32(b) => b.append_null(),
             }
@@ -289,15 +373,12 @@ fn parse_row(
         let field_len_usize = field_len_i32 as usize;
 
         // 2. Check if we have enough bytes in *this chunk* for the *entire field*
-        // This is a "look-ahead" check *before* we consume bytes.
         if (cursor.position() as usize + field_len_usize) > current_chunk.len() {
             // Partial read: The field's data is split.
-            // We return an EOF error to signal the outer loop.
             return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Partial field read"));
         }
 
         // 3. We have enough bytes. Parse it.
-        // These reads will now succeed because we checked the length.
         match builder {
             DynamicBuilder::Int64(b) => {
                 let val = cursor.read_i64::<BigEndian>()?;
@@ -318,14 +399,13 @@ fn parse_row(
             DynamicBuilder::String(b) => {
                 let mut str_buf = vec![0; field_len_usize];
                 cursor.read_exact(&mut str_buf)?;
-                // This str::from_utf8 is a potential panic! We should handle it.
                 let val_str = str::from_utf8(&str_buf)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
                 b.append_value(val_str);
             }
             DynamicBuilder::Boolean(b) => {
                 let val_bool = cursor.read_u8()?;
-                b.append_value(val_bool != 0);
+                b.append_value(val_bool != 0); 
             }
             DynamicBuilder::Timestamp(b) => {
                 let pg_micros = cursor.read_i64::<BigEndian>()?;
@@ -344,6 +424,6 @@ fn parse_row(
             }
         }
     } // End field loop
-
+    
     Ok(()) // Row was successfully parsed
 }
