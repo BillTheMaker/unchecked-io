@@ -6,12 +6,18 @@ mod parser;
 use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
 use tokio;
-use pyo3::types::{PyModule, PyAny}; // Added PyAny
+use pyo3::types::{PyModule, PyAny};
 use pyo3::Bound;
-
-// FIX 1: Import PyRecordBatch.
 use pyo3_arrow::PyRecordBatch;
 
+// Use the high-performance mimalloc for better multi-threaded memory allocation.
+// We conditionally compile it to avoid issues on MSVC targets.
+#[cfg(not(target_env = "msvc"))]
+use mimalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 // --- Internal Crates ---
 use crate::config::{load_and_validate_config, ConnectorConfig};
@@ -21,15 +27,14 @@ use crate::parser::run_db_logic;
 // --- THE PYTHON-CALLABLE ENTRY POINT ---
 
 #[pyfunction]
+#[pyo3(signature = (config_path, blast_radius=312500))]
 #[allow(unsafe_code)]
 #[allow(unsafe_op_in_unsafe_fn)]
 #[allow(rust_2024_compatibility)]
-// FIX 2: Updated signature to accept 'blast_radius' and return 'Bound<'py, PyAny>'
-// This matches what you confirmed works with .into_pyarrow(py).
 fn load_data_from_config<'py>(
     py: Python<'py>,
     config_path: String,
-    blast_radius: i64
+    blast_radius: i64,
 ) -> PyResult<Bound<'py, PyAny>> {
 
     // --- Phase 1: Load and Validate Configuration ---
@@ -49,17 +54,12 @@ fn load_data_from_config<'py>(
             .build()
             .unwrap()
             .block_on(async {
-                // FIX 3: Pass the 'blast_radius' argument to the parser logic
                 run_db_logic(config, blast_radius).await
             })
     }).map_err(|e| PyValueError::new_err(format!("Database/Runtime Error: {:?}", e)))?;
 
     // --- Phase 3: Return Data to Python ---
-
-    // Create the wrapper. .new() takes one argument in this version.
     let py_record_batch = PyRecordBatch::new(record_batch);
-
-    // Call the correct conversion method which returns PyResult<Bound<'py, PyAny>>
     py_record_batch.into_pyarrow(py)
 }
 
@@ -68,8 +68,6 @@ fn load_data_from_config<'py>(
 
 #[pymodule]
 fn unchecked_io(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // FIX 4: Use the two-argument wrap_pyfunction! macro pattern which you confirmed works.
     m.add_function(wrap_pyfunction!(load_data_from_config, m)?)?;
-
     Ok(())
 }

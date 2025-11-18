@@ -36,7 +36,7 @@ SELECT
     (random() * 10 + 100)::INT AS course_id,
     (NOW() - (random() * '1000 days'::INTERVAL))::DATE AS start_date,
     (random() * 5)::FLOAT8 AS rating
-FROM generate_series(1, 5000000) s(i);
+FROM generate_series(1, 20000000) s(i);
 
 -- 4. Analyze the table for better query planning (good practice)
 ANALYZE benchmark_table;

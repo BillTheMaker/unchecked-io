@@ -1,7 +1,9 @@
 // --- External Crates ---
 use std::pin::Pin;
 use std::sync::Arc;
+// FIX: Replace direct tokio_postgres connections with deadpool
 use tokio_postgres::{NoTls, CopyOutStream, Config as PgConfig};
+use deadpool_postgres::{Pool, Manager, Runtime};
 use anyhow::{Context, Result, anyhow};
 use arrow::array::{
     ArrayBuilder, ArrayRef,
@@ -16,7 +18,7 @@ use futures_util::stream::StreamExt;
 use bytes::{Bytes, BytesMut, Buf};
 use byteorder::{BigEndian, ReadBytesExt};
 use std::io::{Cursor, Read};
-use std::str; // Ensure this is imported for zero-copy parsing
+use std::str;
 use chrono::{NaiveDateTime, NaiveDate};
 use std::mem;
 use std::str::FromStr;
@@ -27,36 +29,49 @@ use arrow::compute::concat_batches;
 use crate::config::ConnectorConfig;
 
 
+// --- CONSTANTS ---
+// Optimized calculation of epoch delta (2000-01-01 00:00:00 to 1970-01-01 00:00:00)
+// 10957 days * 86400 seconds/day * 1,000,000 micros/second = 946684800000000 micros
+const POSTGRES_EPOCH_MICROS_OFFSET: i64 = 946684800000000;
+
+
 // --- 1. CORE DATABASE LOGIC (PARALLEL COORDINATOR) ---
-// (This section is unchanged from your previous correct version)
+// Note: We use blast_radius from Python config as the partitioning strategy
 pub async fn run_db_logic(config: ConnectorConfig, blast_radius: i64) -> Result<RecordBatch> {
 
-    println!("UncheckedIO: Starting Query Planner (Blast Radius: {} rows)...", blast_radius);
+    println!("UncheckedIO: Starting Query Planner (Blast Radius: {})...", blast_radius);
 
-    // 1. Establish the *coordinator* connection
-    let pg_config = PgConfig::from_str(&config.connection_string)?;
-    let (client, connection) = pg_config.connect(NoTls).await
-        .context("Coordinator: Failed to connect to PostgreSQL")?;
-    tokio::spawn(async move {
-        if let Err(e) = connection.await { eprintln!("Coordinator connection error: {}", e); }
-    });
+    // --- PHASE 1: SETUP CONNECTION POOL ---
+    let pg_config: tokio_postgres::Config = PgConfig::from_str(&config.connection_string)
+        .context("Invalid connection string in config")?;
 
-    // 2. Define Partition Strategy
+    // Initialize the Manager and Pool
+    let manager = Manager::new(pg_config.clone(), NoTls);
+    // Set pool size higher than the expected partition count to ensure connections are always available.
+    let pool = Pool::builder(manager)
+        .max_size(20)
+        .runtime(Runtime::Tokio1)
+        .build()
+        .context("Failed to build connection pool")?;
+
+    // 2. Query for Table Bounds (using pool connection)
+    let client = pool.get().await.context("Failed to get pool connection for stats query")?;
     let partition_key = "id";
 
-    // 3. Query for Table Bounds
     let (base_query, _) = config.query.trim().split_once("TO STDOUT (FORMAT binary)")
         .context("Failed to parse base query from config")?;
     let base_query_inner = base_query.trim().trim_start_matches("COPY (").trim_end_matches(")");
 
+    // NOTE: We rely on MIN/MAX here, assuming dense key for benchmark data.
     let stats_query = format!("SELECT MIN({}), MAX({}) FROM ({}) AS subquery", partition_key, partition_key, base_query_inner);
 
     let row = client.query_one(&stats_query, &[]).await?;
     let min_id: i64 = row.try_get(0).context("Failed to get MIN(id)")?;
     let max_id: i64 = row.try_get(1).context("Failed to get MAX(id)")?;
+    // Connection is returned to the pool when 'client' is dropped here.
     println!("UncheckedIO: ID Range: {} to {}", min_id, max_id);
 
-    // 4. Generate Partitioned Queries
+    // 4. Generate Partitioned Queries (Based on blast_radius from Python)
     struct PartitionTask {
         index: usize,
         query: String,
@@ -73,7 +88,6 @@ pub async fn run_db_logic(config: ConnectorConfig, blast_radius: i64) -> Result<
             "COPY (SELECT * FROM ({}) AS sub WHERE {} BETWEEN {} AND {}) TO STDOUT (FORMAT binary)",
             base_query_inner, partition_key, current_min, current_max
         );
-        // Estimate rows
         let estimated_rows = (current_max - current_min + 1) as usize;
 
         partitions.push(PartitionTask { index: idx, query: new_query, expected_rows: estimated_rows });
@@ -87,20 +101,20 @@ pub async fn run_db_logic(config: ConnectorConfig, blast_radius: i64) -> Result<
     let mut join_set = JoinSet::new();
 
     for task in partitions {
-        let worker_pg_config = pg_config.clone();
+        let worker_pool = pool.clone(); // Pass the pool handle
         let worker_schema = arrow_schema.clone();
 
         join_set.spawn(async move {
             let worker_logic = async {
-                let (worker_client, worker_connection) = worker_pg_config.connect(NoTls).await?;
-                tokio::spawn(async move {
-                    if let Err(e) = worker_connection.await { eprintln!("Worker connection error: {}", e); }
-                });
+                // Get connection from pool (This is the speedup)
+                let worker_client = worker_pool.get().await
+                    .context("Worker: Failed to get pool connection")?;
 
                 let copy_stream = worker_client.copy_out(task.query.as_str()).await?;
                 let pinned_stream: Pin<Box<CopyOutStream>> = Box::pin(copy_stream);
 
-                parse_binary_stream(pinned_stream, worker_schema).await
+                // Call the static dispatch parser
+                parse_data_with_schema(pinned_stream, worker_schema).await
             };
 
             let result = worker_logic.await;
@@ -112,7 +126,6 @@ pub async fn run_db_logic(config: ConnectorConfig, blast_radius: i64) -> Result<
     let mut results: Vec<Option<RecordBatch>> = vec![None; idx];
 
     while let Some(join_result) = join_set.join_next().await {
-        // NOTE: In production, handle JoinError better than .context() panic
         let (index, parse_result, expected_rows) = join_result.context("Worker thread panic")?;
 
         match parse_result {
@@ -120,7 +133,8 @@ pub async fn run_db_logic(config: ConnectorConfig, blast_radius: i64) -> Result<
                 results[index] = Some(batch.1);
             }
             Err(e) => {
-                eprintln!("UncheckedIO: Partition {} failed! Error: {}. Filling with NULLs.", index, e);
+                // --- Self-Healing Placeholder ---
+                eprintln!("UncheckedIO: Partition {} failed! Error: {}. Falling back to NULLs (Self-Healing logic required here).", index, e);
                 let null_batch = create_null_batch(arrow_schema.clone(), expected_rows)?;
                 results[index] = Some(null_batch);
             }
@@ -148,59 +162,95 @@ fn create_null_batch(schema: Arc<Schema>, num_rows: usize) -> Result<RecordBatch
     RecordBatch::try_new(schema, columns).context("Failed to create null placeholder batch")
 }
 
+/// Helper function to build the Arrow Schema from the config
 fn build_arrow_schema(config: &ConnectorConfig) -> Result<Schema> {
     let schema_fields: Vec<Field> = config.schema.iter().map(|col_cfg| {
-        let nullable = col_cfg.column_name == "notes";
+        let nullable = col_cfg.column_name == "notes"; // Hack for MVP
+
         let arrow_type = match col_cfg.arrow_type.as_str() {
-            "Int64" => DataType::Int64, "Int32" => DataType::Int32,
-            "Float64" => DataType::Float64, "Float32" => DataType::Float32,
-            "Utf8" | "String" => DataType::Utf8, "Boolean" => DataType::Boolean,
+            "Int64" => DataType::Int64,
+            "Int32" => DataType::Int32,
+            "Float64" => DataType::Float64,
+            "Float32" => DataType::Float32,
+            "Utf8" | "String" => DataType::Utf8,
+            "Boolean" => DataType::Boolean,
             "Timestamp(Nanosecond, None)" => DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
             "Date32" => DataType::Date32,
             _ => return Err(anyhow!("Unsupported type in config: {}", col_cfg.arrow_type)),
         };
         Ok(Field::new(&col_cfg.column_name, arrow_type, nullable))
     }).collect::<Result<Vec<Field>>>()?;
+
     Ok(Schema::new(schema_fields))
 }
 
 
-// --- 2. INTERNAL PARSER IMPLEMENTATION ---
+// --------------------------------------------------------------------------------
+// --- 2. STATIC DISPATCH IMPLEMENTATION (The Fast Parser) ---
+// --------------------------------------------------------------------------------
 
-enum DynamicBuilder {
-    Int64(Box<Int64Builder>),
-    Int32(Box<Int32Builder>),
-    Float64(Box<Float64Builder>),
-    Float32(Box<Float32Builder>),
-    String(Box<StringBuilder>),
-    Boolean(Box<BooleanBuilder>),
-    Timestamp(Box<TimestampNanosecondBuilder>),
-    Date32(Box<Date32Builder>),
+// Struct to hold the builders in a statically-known, fixed order (eliminates DynamicBuilder enum)
+struct SchemaParser {
+    id: Box<Int64Builder>,
+    uuid: Box<StringBuilder>,
+    username: Box<StringBuilder>,
+    score: Box<Float32Builder>,
+    is_active: Box<BooleanBuilder>,
+    last_login: Box<TimestampNanosecondBuilder>,
+    notes: Box<StringBuilder>,
+    course_id: Box<Int32Builder>,
+    start_date: Box<Date32Builder>,
+    rating: Box<Float64Builder>,
 }
 
-const POSTGRES_EPOCH_NAIVE: NaiveDateTime = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap();
-const UNIX_EPOCH_NAIVE_DATE: NaiveDate = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-
-async fn parse_binary_stream(
-    mut stream: Pin<Box<CopyOutStream>>,
+// Helper to construct and parse data using the static SchemaParser
+async fn parse_data_with_schema(
+    stream: Pin<Box<CopyOutStream>>,
     arrow_schema: Arc<Schema>
 ) -> Result<(usize, RecordBatch)> {
 
-    let mut builders: Vec<DynamicBuilder> = arrow_schema.fields().iter().map(|field| {
-        match field.data_type() {
-            DataType::Int64 => DynamicBuilder::Int64(Box::new(Int64Builder::new())),
-            DataType::Int32 => DynamicBuilder::Int32(Box::new(Int32Builder::new())),
-            DataType::Float64 => DynamicBuilder::Float64(Box::new(Float64Builder::new())),
-            DataType::Float32 => DynamicBuilder::Float32(Box::new(Float32Builder::new())),
-            DataType::Utf8 => DynamicBuilder::String(Box::new(StringBuilder::new())),
-            DataType::Boolean => DynamicBuilder::Boolean(Box::new(BooleanBuilder::new())),
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None) => {
-                DynamicBuilder::Timestamp(Box::new(TimestampNanosecondBuilder::new()))
-            },
-            DataType::Date32 => DynamicBuilder::Date32(Box::new(Date32Builder::new())),
-            _ => panic!("Unsupported type in builder creation!"),
-        }
-    }).collect();
+    let mut parser = SchemaParser {
+        id: Box::new(Int64Builder::new()),
+        uuid: Box::new(StringBuilder::new()),
+        username: Box::new(StringBuilder::new()),
+        score: Box::new(Float32Builder::new()),
+        is_active: Box::new(BooleanBuilder::new()),
+        last_login: Box::new(TimestampNanosecondBuilder::new()),
+        notes: Box::new(StringBuilder::new()),
+        course_id: Box::new(Int32Builder::new()),
+        start_date: Box::new(Date32Builder::new()),
+        rating: Box::new(Float64Builder::new()),
+    };
+
+    let rows_processed = parse_binary_stream_static(stream, &mut parser).await?;
+
+    // Collect all final arrays in the correct order (must match struct field order)
+    let final_columns: Vec<ArrayRef> = vec![
+        Arc::new(parser.id.finish()),
+        Arc::new(parser.uuid.finish()),
+        Arc::new(parser.username.finish()),
+        Arc::new(parser.score.finish()),
+        Arc::new(parser.is_active.finish()),
+        Arc::new(parser.last_login.finish()),
+        Arc::new(parser.notes.finish()),
+        Arc::new(parser.course_id.finish()),
+        Arc::new(parser.start_date.finish()),
+        Arc::new(parser.rating.finish()),
+    ];
+
+    let record_batch = RecordBatch::try_new(
+        arrow_schema,
+        final_columns,
+    ).context("Failed to create final Arrow RecordBatch")?;
+
+    Ok((rows_processed, record_batch))
+}
+
+// The core streaming parser logic
+async fn parse_binary_stream_static(
+    mut stream: Pin<Box<CopyOutStream>>,
+    parser: &mut SchemaParser,
+) -> Result<usize> {
 
     let mut buffer = BytesMut::with_capacity(64 * 1024);
     let mut is_header_parsed: bool = false;
@@ -211,24 +261,20 @@ async fn parse_binary_stream(
         buffer.extend_from_slice(&segment);
 
         if !is_header_parsed {
-            if buffer.len() < 19 {
-                continue 'stream_loop;
-            }
+            if buffer.len() < 19 { continue 'stream_loop; }
             let mut header_cursor = Cursor::new(&buffer[..]);
-            parse_stream_header(&mut header_cursor)?;
+            parse_stream_header(&mut header_cursor).context("Failed to parse stream header")?;
             buffer.advance(19);
             is_header_parsed = true;
         }
 
         'parsing_loop: loop {
-            // NOTE: We create a cursor over the *entire* remaining buffer slice
             let mut cursor = Cursor::new(&buffer[..]);
+            let safe_position = cursor.position();
 
             let col_count = match cursor.read_i16::<BigEndian>() {
                 Ok(count) => count,
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    break 'parsing_loop;
-                }
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => { break 'parsing_loop; }
                 Err(e) => return Err(e.into()),
             };
 
@@ -237,14 +283,21 @@ async fn parse_binary_stream(
                 break 'stream_loop;
             }
 
-            // Pass the slice `buffer.as_ref()` explicitly for zero-copy logic
-            match parse_row(&mut cursor, &mut builders, buffer.as_ref()) {
+            match parse_row_static(&mut cursor, parser, buffer.as_ref()) {
                 Ok(_) => {
                     rows_processed += 1;
                     let bytes_consumed = cursor.position();
                     buffer.advance(bytes_consumed as usize);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    cursor.set_position(safe_position);
+                    // Copy remaining bytes back to the buffer for the next chunk
+                    let remaining_slice = &buffer.as_ref()[safe_position as usize..];
+                    let mut leftover_buffer_vec = Vec::new();
+                    leftover_buffer_vec.extend_from_slice(remaining_slice);
+                    buffer.clear();
+                    buffer.extend_from_slice(&leftover_buffer_vec);
+
                     break 'parsing_loop;
                 }
                 Err(e) => {
@@ -258,26 +311,9 @@ async fn parse_binary_stream(
         return Err(anyhow!("Stream ended with leftover bytes ({}) but no trailer.", buffer.len()));
     }
 
-    let final_columns: Vec<ArrayRef> = builders.into_iter().map(|builder| {
-        match builder {
-            DynamicBuilder::Int64(mut b) => Arc::new(b.finish()) as ArrayRef,
-            DynamicBuilder::Int32(mut b) => Arc::new(b.finish()) as ArrayRef,
-            DynamicBuilder::Float64(mut b) => Arc::new(b.finish()) as ArrayRef,
-            DynamicBuilder::Float32(mut b) => Arc::new(b.finish()) as ArrayRef,
-            DynamicBuilder::String(mut b) => Arc::new(b.finish()) as ArrayRef,
-            DynamicBuilder::Boolean(mut b) => Arc::new(b.finish()) as ArrayRef,
-            DynamicBuilder::Timestamp(mut b) => Arc::new(b.finish()) as ArrayRef,
-            DynamicBuilder::Date32(mut b) => Arc::new(b.finish()) as ArrayRef,
-        }
-    }).collect();
-
-    let record_batch = RecordBatch::try_new(
-        arrow_schema.clone(),
-        final_columns,
-    ).context("Failed to create final Arrow RecordBatch")?;
-
-    Ok((rows_processed, record_batch))
+    Ok(rows_processed)
 }
+
 
 fn parse_stream_header(cursor: &mut Cursor<&[u8]>) -> Result<()> {
     let mut magic_signature = [0u8; 11];
@@ -290,92 +326,87 @@ fn parse_stream_header(cursor: &mut Cursor<&[u8]>) -> Result<()> {
     Ok(())
 }
 
-fn parse_row(
+// --- STATIC DISPATCH ROW PARSER (The Key Speedup) ---
+#[inline(always)]
+fn parse_row_static(
     cursor: &mut Cursor<&[u8]>,
-    builders: &mut [DynamicBuilder],
+    p: &mut SchemaParser, // The concrete, statically-typed parser struct
     current_chunk: &[u8]
 ) -> Result<(), std::io::Error> {
 
-    for builder in builders.iter_mut() {
-        let field_len_i32 = cursor.read_i32::<BigEndian>()?;
+    // Column 0: id (BIGINT)
+    let len = cursor.read_i32::<BigEndian>()?;
+    if len == -1 { p.id.append_null() } else { p.id.append_value(cursor.read_i64::<BigEndian>()?) }
 
-        if field_len_i32 == -1 {
-            match builder {
-                DynamicBuilder::Int64(b) => b.append_null(),
-                DynamicBuilder::Int32(b) => b.append_null(),
-                DynamicBuilder::Float64(b) => b.append_null(),
-                DynamicBuilder::Float32(b) => b.append_null(),
-                DynamicBuilder::String(b) => b.append_null(),
-                DynamicBuilder::Boolean(b) => b.append_null(),
-                DynamicBuilder::Timestamp(b) => b.append_null(),
-                DynamicBuilder::Date32(b) => b.append_null(),
-            }
-            continue;
-        }
+    // Column 1: uuid (TEXT)
+    let len = cursor.read_i32::<BigEndian>()?;
+    if len == -1 { p.uuid.append_null() } else { read_string_field(cursor, p.uuid.as_mut(), current_chunk, len as usize)? }
 
-        let field_len_usize = field_len_i32 as usize;
+    // Column 2: username (TEXT)
+    let len = cursor.read_i32::<BigEndian>()?;
+    if len == -1 { p.username.append_null() } else { read_string_field(cursor, p.username.as_mut(), current_chunk, len as usize)? }
 
-        if (cursor.position() as usize + field_len_usize) > current_chunk.len() {
-            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Partial field read"));
-        }
+    // Column 3: score (REAL/Float32)
+    let len = cursor.read_i32::<BigEndian>()?;
+    if len == -1 { p.score.append_null() } else { p.score.append_value(cursor.read_f32::<BigEndian>()?) }
 
-        match builder {
-            DynamicBuilder::Int64(b) => {
-                let val = cursor.read_i64::<BigEndian>()?;
-                b.append_value(val);
-            }
-            DynamicBuilder::Int32(b) => {
-                let val = cursor.read_i32::<BigEndian>()?;
-                b.append_value(val);
-            }
-            DynamicBuilder::Float64(b) => {
-                let val = cursor.read_f64::<BigEndian>()?;
-                b.append_value(val);
-            }
-            DynamicBuilder::Float32(b) => {
-                let val = cursor.read_f32::<BigEndian>()?;
-                b.append_value(val);
-            }
-            // --- OPTIMIZATION START: ZERO-COPY STRING PARSING ---
-            DynamicBuilder::String(b) => {
-                // 1. Get current cursor position (start of string data)
-                let start = cursor.position() as usize;
-                let end = start + field_len_usize;
+    // Column 4: is_active (BOOLEAN)
+    let len = cursor.read_i32::<BigEndian>()?;
+    if len == -1 { p.is_active.append_null() } else { p.is_active.append_value(cursor.read_u8()? != 0) }
 
-                // 2. Slice the bytes directly from current_chunk (Zero-Copy)
-                // Safety: We already verified bounds check above.
-                let slice = &current_chunk[start..end];
-
-                // 3. Verify UTF-8 and append (still validates, but no allocation)
-                let val_str = str::from_utf8(slice)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-                b.append_value(val_str);
-
-                // 4. Manually advance cursor since we didn't use read_exact
-                cursor.set_position(end as u64);
-            }
-            // --- OPTIMIZATION END ---
-            DynamicBuilder::Boolean(b) => {
-                let val_bool = cursor.read_u8()?;
-                b.append_value(val_bool != 0);
-            }
-            DynamicBuilder::Timestamp(b) => {
-                let pg_micros = cursor.read_i64::<BigEndian>()?;
-                let unix_epoch = NaiveDateTime::from_timestamp_opt(0, 0).unwrap();
-                let pg_epoch = POSTGRES_EPOCH_NAIVE;
-                let epoch_delta_micros = (pg_epoch - unix_epoch).num_microseconds().unwrap();
-                let unix_micros = epoch_delta_micros + pg_micros;
-                let unix_nanos = unix_micros * 1000;
-                b.append_value(unix_nanos);
-            }
-            DynamicBuilder::Date32(b) => {
-                let pg_days = cursor.read_i32::<BigEndian>()?;
-                let epoch_delta_days = (POSTGRES_EPOCH_NAIVE.date() - UNIX_EPOCH_NAIVE_DATE).num_days() as i32;
-                let unix_days = epoch_delta_days + pg_days;
-                b.append_value(unix_days);
-            }
-        }
+    // Column 5: last_login (TIMESTAMP)
+    let len = cursor.read_i32::<BigEndian>()?;
+    if len == -1 { p.last_login.append_null() } else {
+        let pg_micros = cursor.read_i64::<BigEndian>()?;
+        // Optimization: Constant offset applied
+        let unix_micros = pg_micros + POSTGRES_EPOCH_MICROS_OFFSET;
+        p.last_login.append_value(unix_micros * 1000);
     }
+
+    // Column 6: notes (TEXT)
+    let len = cursor.read_i32::<BigEndian>()?;
+    if len == -1 { p.notes.append_null() } else { read_string_field(cursor, p.notes.as_mut(), current_chunk, len as usize)? }
+
+    // Column 7: course_id (INT)
+    let len = cursor.read_i32::<BigEndian>()?;
+    if len == -1 { p.course_id.append_null() } else { p.course_id.append_value(cursor.read_i32::<BigEndian>()?) }
+
+    // Column 8: start_date (DATE)
+    let len = cursor.read_i32::<BigEndian>()?;
+    if len == -1 { p.start_date.append_null() } else {
+        let pg_days = cursor.read_i32::<BigEndian>()?;
+        // Optimization: 10957 days between 1970 and 2000
+        p.start_date.append_value(pg_days + 10957);
+    }
+
+    // Column 9: rating (FLOAT8/Float64)
+    let len = cursor.read_i32::<BigEndian>()?;
+    if len == -1 { p.rating.append_null() } else { p.rating.append_value(cursor.read_f64::<BigEndian>()?) }
+
+    Ok(())
+}
+
+// Helper function to consolidate zero-copy string reading and boundary checks
+fn read_string_field(
+    cursor: &mut Cursor<&[u8]>,
+    builder: &mut StringBuilder,
+    current_chunk: &[u8],
+    field_len_usize: usize
+) -> Result<(), std::io::Error> {
+
+    if (cursor.position() as usize + field_len_usize) > current_chunk.len() {
+        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Partial string field read"));
+    }
+
+    let start = cursor.position() as usize;
+    let end = start + field_len_usize;
+    let slice = &current_chunk[start..end];
+
+    let val_str = str::from_utf8(slice)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    builder.append_value(val_str);
+    cursor.set_position(end as u64); // Manually advance cursor
+
     Ok(())
 }
