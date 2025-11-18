@@ -1,9 +1,9 @@
 [package]
 name = "unchecked-io"
 version = "0.1.0"
-authors = ["Your Name/Alias"] # Replace with your name or alias
-license = "MIT OR Apache-2.0" # Good practice for open-source
-edition = "2021"
+authors = ["Billthemaker"] # Replace with your name or alias
+license = "BSL-1" # Good practice for open-source
+edition = "2024"
 
 [lib] 
 name = "unchecked_io"
@@ -26,11 +26,12 @@ tokio = { version = "1.37", features = ["full"] }
 
 # 5. Database Connection (Postgres)
 tokio-postgres = "0.7"
+deadpool-postgres = "0.14"
 
-# 6. Error Handling Crate (The FIX)
+# 6. Error Handling Crate
 anyhow = "1.0"
 
-# 7. Futures Utilities (The FIX for StreamExt)
+# 7. Futures Utilities
 futures-util = "0.3"
 
 # 8. Byte Buffer Management
@@ -50,3 +51,6 @@ pyo3-arrow = "0.15.0"
 
 # 13. System CPU Count (NEW)
 num_cpus = "1.16"
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+mimalloc = { version = "0.1.39" }

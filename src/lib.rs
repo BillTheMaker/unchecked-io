@@ -10,6 +10,15 @@ use pyo3::types::{PyModule, PyAny};
 use pyo3::Bound;
 use pyo3_arrow::PyRecordBatch;
 
+// Use the high-performance mimalloc for better multi-threaded memory allocation.
+// We conditionally compile it to avoid issues on MSVC targets.
+#[cfg(not(target_env = "msvc"))]
+use mimalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 // --- Internal Crates ---
 use crate::config::{load_and_validate_config, ConnectorConfig};
 use crate::parser::run_db_logic;
@@ -17,9 +26,8 @@ use crate::parser::run_db_logic;
 
 // --- THE PYTHON-CALLABLE ENTRY POINT ---
 
-// Updated signature: Removed danger_mode as it's now permanently true (unchecked)
 #[pyfunction]
-#[pyo3(signature = (config_path, blast_radius=312500))] // Optimized default blast radius
+#[pyo3(signature = (config_path, blast_radius=312500))]
 #[allow(unsafe_code)]
 #[allow(unsafe_op_in_unsafe_fn)]
 #[allow(rust_2024_compatibility)]
@@ -46,7 +54,6 @@ fn load_data_from_config<'py>(
             .build()
             .unwrap()
             .block_on(async {
-                // Now only passes the two required args
                 run_db_logic(config, blast_radius).await
             })
     }).map_err(|e| PyValueError::new_err(format!("Database/Runtime Error: {:?}", e)))?;
