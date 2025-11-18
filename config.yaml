@@ -1,28 +1,25 @@
 connection_string: postgresql://postgres:mysecretpassword@localhost:5433/postgres
-
-# The query to execute. This MUST be a COPY...TO STDOUT (FORMAT binary) command.
-# We cast all columns to match the binary types our parser expects.
-query: "COPY (SELECT id::BIGINT, uuid::TEXT, username::TEXT, score::REAL, is_active::BOOLEAN, last_login::TIMESTAMP, notes::TEXT, course_id::INT, start_date::DATE, rating::FLOAT8 FROM benchmark_table) TO STDOUT (FORMAT binary)"
-
-# 'schema' is the ordered list of columns *exactly* as they appear in the query's SELECT statement.
+query: COPY (SELECT id::BIGINT, uuid::TEXT, username::TEXT, score::REAL, is_active::BOOLEAN,
+  last_login::TIMESTAMP, notes::TEXT, course_id::INT, start_date::DATE, rating::FLOAT8
+  FROM benchmark_table) TO STDOUT (FORMAT binary)
 schema:
-  - column_name: id
-    arrow_type: Int64
-  - column_name: uuid
-    arrow_type: Utf8
-  - column_name: username
-    arrow_type: Utf8
-  - column_name: score
-    arrow_type: Float32
-  - column_name: is_active
-    arrow_type: Boolean
-  - column_name: last_login
-    arrow_type: Timestamp(Nanosecond, None)
-  - column_name: notes
-    arrow_type: Utf8
-  - column_name: course_id
-    arrow_type: Int32
-  - column_name: start_date
-    arrow_type: Date32
-  - column_name: rating
-    arrow_type: Float64
+- arrow_type: Int64
+  column_name: id
+- arrow_type: Utf8
+  column_name: uuid
+- arrow_type: Utf8
+  column_name: username
+- arrow_type: Float32
+  column_name: score
+- arrow_type: Boolean
+  column_name: is_active
+- arrow_type: Timestamp(Nanosecond, None)
+  column_name: last_login
+- arrow_type: Utf8
+  column_name: notes
+- arrow_type: Int32
+  column_name: course_id
+- arrow_type: Date32
+  column_name: start_date
+- arrow_type: Float64
+  column_name: rating
