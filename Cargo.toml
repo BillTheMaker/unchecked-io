@@ -1,36 +1,52 @@
 [package]
 name = "unchecked-io"
 version = "0.1.0"
-authors = ['billthemaker']
-license = "MIT OR Apache-2.0"
-edition = "2024"
+authors = ["Your Name/Alias"] # Replace with your name or alias
+license = "MIT OR Apache-2.0" # Good practice for open-source
+edition = "2021"
 
-[lib]
-
+[lib] 
 name = "unchecked_io"
-
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib", "rlib"] 
 
 [dependencies]
 # 1. Python Bindings for FFI
 pyo3 = { version = "0.27.1", features = ["extension-module"] }
 
-# 2. Configuration Parsing
+# 2. Configuration Parsing (YAML)
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 
-# 3. Apache Arrow
+# 3. Apache Arrow and Data Handling
+# FIX: Add the "compute" feature to get concat_batches
 arrow = "57.0.0"
 
-# 4. Asynchronous Runtime
-tokio = { version = "1.48.0", features = ["full"] }
+# 4. Asynchronous Runtime (Essential for I/O and Postgres)
+tokio = { version = "1.37", features = ["full"] }
 
-# 5. DB Connection (Postgres)
-tokio-postgres = "0.7.15"
-anyhow = "1.0.100"
-futures-util = "0.3.31"
-bytes = "1.11.0"
-byteorder = "1.5.0"
+# 5. Database Connection (Postgres)
+tokio-postgres = "0.7"
+
+# 6. Error Handling Crate (The FIX)
+anyhow = "1.0"
+
+# 7. Futures Utilities (The FIX for StreamExt)
+futures-util = "0.3"
+
+# 8. Byte Buffer Management
+bytes = "1.6"
+
+# 9. Binary Data Reading (NEW)
+byteorder = "1.5"
+
+# 10. Timestamp Handling (NEW)
 chrono = "0.4"
+
+# 11. UUID Handling (NEW)
 uuid = { version = "1.8", features = ["serde", "v4"] }
+
+# 12. Arrow <-> Python Bridge (NEW)
 pyo3-arrow = "0.15.0"
+
+# 13. System CPU Count (NEW)
+num_cpus = "1.16"
