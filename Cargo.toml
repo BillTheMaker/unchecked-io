@@ -11,7 +11,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # 1. Python Bindings for FFI
-pyo3 = { version = "0.20", features = ["extension-module"] }
+pyo3 = { version = "0.27.1", features = ["extension-module"] }
 
 # 2. Configuration Parsing (YAML)
 serde = { version = "1.0", features = ["derive"] }
@@ -19,7 +19,7 @@ serde_yaml = "0.9"
 
 # 3. Apache Arrow and Data Handling
 # FIX: Add the "compute" feature to get concat_batches
-arrow = { version = "50.0", features = ["compute"] }
+arrow = "57.0.0"
 
 # 4. Asynchronous Runtime (Essential for I/O and Postgres)
 tokio = { version = "1.37", features = ["full"] }
@@ -46,7 +46,7 @@ chrono = "0.4"
 uuid = { version = "1.8", features = ["serde", "v4"] }
 
 # 12. Arrow <-> Python Bridge (NEW)
-pyo3-arrow = "0.13"
+pyo3-arrow = "0.15.0"
 
 # 13. System CPU Count (NEW)
 num_cpus = "1.16"

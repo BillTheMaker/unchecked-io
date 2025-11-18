@@ -1,0 +1,125 @@
+Project `UncheckedIO` - Roadmap & Decision Log
+
+Date: 2025-11-18
+
+Status: MVP (single-threaded) is functional and benchmarks show it is 2x faster than ConnectorX in a cloud (Colab) environment. The parallel-executor branch (gobrrr) is currently failing to build.
+
+## 1. Project Philosophy & Goal
+
+The primary goal of `UncheckedIO` is to create the fastest possible data connector for bulk-loading data from a PostgreSQL database directly into a Python/Arrow environment.
+
+The core philosophy is the **"Configured Opinion"**:
+
+1. **The Problem:** Generic connectors waste significant CPU time at runtime discovering schemas and validating data types.
+
+2. **Our Solution:** We _require_ the user to provide an explicit `config.yaml` file that defines the query and the exact, ordered schema. We **trust this config** to skip expensive checks.
+
+3. **The "Unchecked" Joke:** The name is a warning. The library is "unchecked" (skipping runtime validation) to gain speed. The Rust compiler provides _memory_ safety; the user provides _schema_ safety.
+
+
+## 2. Core Architectural Decisions
+
+- **Stack:** Rust core (Tokio, Arrow, `tokio-postgres`) with a `PyO3`/`Maturin` bridge to Python.
+
+- **Data Flow:** We _must_ use the PostgreSQL `COPY ... TO STDOUT (FORMAT binary)` protocol. This is the "firehose" that bypasses slow, row-by-row SQL serialization.
+
+- **Parser:** We use a **Streaming Parser** (`parse_binary_stream`). This is the "Sprint 2" logic. It reads the `COPY` stream in small chunks, manages a `leftover_buffer` for partial rows, and parses bytes as they arrive. This has a tiny, constant memory footprint and is the **core engine for all operations**.
+
+- **License:** **Business Source License (BSL) 1.1**.
+
+    - The _entire_ codebase (including "Pro" features) is source-available.
+
+    - It is **Free** for non-production use and for production use by entities with < $1M annual revenue.
+
+    - **Paid** commercial licenses are required for production use by all other entities.
+
+
+## 3. Current Status & Blockers (The `gobrrr` Branch)
+
+- **`main` Branch (WORKING):** Contains the **Sprint 2** single-threaded streaming parser.
+
+    - **Benchmark (Colab):** ~1603 ms (2x faster than ConnectorX).
+
+    - **FFI Status:** The complex `pyo3-arrow` FFI issues _on this branch_ are **SOLVED**. The correct, working syntax is:
+
+        - `fn open_floodgates<'py>(py: Python<'py>, ...) -> PyResult<Bound<'py, PyAny>>`
+
+        - `let py_record_batch = PyRecordBatch::new(record_batch); py_record_batch.into_pyarrow(py)`
+
+        - `m.add_function(wrap_pyfunction!(open_floodgates, m)?)?`
+
+- **`gobrrr` Branch (BROKEN):** Contains the **Sprint 3** parallel executor logic.
+
+    - **Status:** This branch is **failing to compile**.
+
+    - **Unknown Errors:** We have not debugged these build failures yet, as they only appeared after the major refactor to introduce the parallel coordinator. This will be the first task when back at the IDE.
+
+
+## 🏁 Next Sprints: The Roadmap
+
+### Sprint 3: The Parallel Coordinator (The "Batch King")
+
+This is the "dynamic work queue" architecture. We need to debug the `gobrrr` branch to get this working.
+
+- [ ] **Task 1: Debug Build Failures**
+
+    - Get the `gobrrr` branch (which contains the parallel `run_db_logic` coordinator) to compile.
+
+- [ ] **Task 2: Implement the `MIN/MAX` Pre-Query**
+
+    - `run_db_logic` runs `SELECT MIN(id), MAX(id) FROM ...` to find table boundaries.
+
+- [ ] **Task 3: Implement the `blast_radius` Parameter**
+
+    - Add a `blast_radius: usize` argument to the `open_floodgates` Python function.
+
+    - The coordinator uses this to create a "work queue" of queries (e.g., `...WHERE id BETWEEN 1 AND 10000`, etc.).
+
+- [ ] **Task 4: Spawn Parallel Workers**
+
+    - Use `tokio::task::JoinSet` to create a pool of workers.
+
+    - Each worker opens its _own_ new database connection.
+
+    - Each worker pulls a query from the queue, runs its `COPY` command, and parses it using our existing `parse_binary_stream` engine.
+
+- [ ] **Task 5: Implement "Self-Healing" Fault Tolerance (Your New Idea)**
+
+    - This is the new, robust error handling model.
+
+    - If a worker task panics (due to messy data in `danger_mode`), the coordinator will:
+
+        1. Catch the `Err` from the `JoinSet`.
+
+        2. Log the error and the failed partition (e.g., "Chunk 4 (rows 40k-50k) failed").
+
+        3. **Re-spawn** that _one_ failed query, but this time passing a `danger_mode=False` flag to the parser.
+
+- [ ] **Task 6: Stitch Results**
+
+    - Use `arrow::compute::concat_batches` to merge all `RecordBatch`es (from both fast-path and safe-path workers) into one final table.
+
+    - Return the final table _and_ a list of the partitions that had to be re-run in safe mode.
+
+
+### Sprint 4: The "Pro" Features (The Parser Logic)
+
+This involves upgrading the _parser engine_ (`parse_binary_stream` and `parse_row`) to be "mode-aware."
+
+- [ ] **Task 7: Implement `danger_mode` Toggle in Parser**
+
+    - Add a `danger_mode: bool` argument to `parse_row`.
+
+    - **If `danger_mode=True`:** Keep the current logic. Use `?` for `read_i64`, `read_f32`, etc. This is fast but will panic on a type mismatch.
+
+    - **If `danger_mode=False` (Safe Mode):** Refactor `parse_row`. Instead of `?`, use `match` for _every_ field read. If the bytes don't match the expected type (e.g., string in an int column), append `NULL` to the builder and continue.
+
+- [ ] **Task 8: Implement the `profile_data` Utility**
+
+    - Create a _new_ `PyFunction` called `profile_data`.
+
+    - This function runs a `SELECT * ... LIMIT 10000`.
+
+    - It _only_ runs the "Safe Mode" parser (`danger_mode=False`).
+
+    - It returns a Python dictionary (a report) of how many `NULL`s were appended per column.
