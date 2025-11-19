@@ -11,7 +11,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # 1. Python Bindings for FFI
-pyo3 = { version = "0.27.1", features = ["extension-module"] }
+pyo3 = { version = "0.27.1", features = ["extension-module", "chrono-tz"] }
 
 # 2. Configuration Parsing (YAML)
 serde = { version = "1.0", features = ["derive"] }
