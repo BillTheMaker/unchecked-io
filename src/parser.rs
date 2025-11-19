@@ -24,6 +24,8 @@ use chrono::{NaiveDateTime, NaiveDate};
 use std::time::Instant;
 use tokio::task::JoinSet;
 use arrow::compute::concat_batches;
+// NEW: Tracing macros for profiling
+use tracing::{span, Level};
 
 // --- Internal Crates ---
 use crate::config::{ConnectorConfig, load_and_validate_config};
@@ -43,9 +45,16 @@ pub async fn run_db_logic(config: ConnectorConfig, blast_radius: i64) -> Result<
     let start_total = Instant::now();
     let start_phase1 = Instant::now();
 
+    // NEW: High-level span for the whole operation
+    let root_span = span!(Level::INFO, "UncheckedIO_Run");
+    let _root_guard = root_span.enter();
+
     println!("UncheckedIO: Starting Query Planner (Blast Radius: {})...", blast_radius);
 
     // --- PHASE 1: SETUP CONNECTION POOL & STATS ---
+    let phase1_span = span!(Level::INFO, "Phase1_Setup");
+    let _p1_guard = phase1_span.enter();
+
     let pg_config: tokio_postgres::Config = PgConfig::from_str(&config.connection_string)
         .context("Invalid connection string in config")?;
 
@@ -94,11 +103,15 @@ pub async fn run_db_logic(config: ConnectorConfig, blast_radius: i64) -> Result<
         idx += 1;
     }
     println!("UncheckedIO: Generated {} parallel partitions.", partitions.len());
+
+    drop(_p1_guard); // End Phase 1 Span
     let duration_phase1 = start_phase1.elapsed();
 
 
     // --- PHASE 2: PARALLEL EXECUTION (DATA TRANSFER + PARSING) ---
     let start_phase2 = Instant::now();
+    let phase2_span = span!(Level::INFO, "Phase2_Execution");
+    let _p2_guard = phase2_span.enter();
 
     let arrow_schema = Arc::new(build_arrow_schema(&config)?);
     let mut join_set = JoinSet::new();
@@ -109,6 +122,10 @@ pub async fn run_db_logic(config: ConnectorConfig, blast_radius: i64) -> Result<
 
         join_set.spawn(async move {
             let worker_logic = async {
+                // Instrument each worker thread so they show up as separate tracks in Tracy
+                let worker_span = span!(Level::INFO, "Worker_Thread", id = task.index);
+                let _w_guard = worker_span.enter();
+
                 let worker_client = worker_pool.get().await
                     .context("Worker: Failed to get pool connection")?;
 
@@ -140,11 +157,15 @@ pub async fn run_db_logic(config: ConnectorConfig, blast_radius: i64) -> Result<
             }
         }
     }
+
+    drop(_p2_guard); // End Phase 2 Span
     let duration_phase2 = start_phase2.elapsed();
 
 
     // --- PHASE 3: CONCATENATION AND FINALIZATION ---
     let start_phase3 = Instant::now();
+    let phase3_span = span!(Level::INFO, "Phase3_Concat");
+    let _p3_guard = phase3_span.enter();
 
     let batches: Vec<RecordBatch> = results.into_iter()
         .filter_map(|b| b)
@@ -164,6 +185,7 @@ pub async fn run_db_logic(config: ConnectorConfig, blast_radius: i64) -> Result<
     let final_batch = concat_batches(&arrow_schema, &batches)
         .context("Failed to concatenate parallel batches")?;
 
+    drop(_p3_guard); // End Phase 3 Span
     let duration_phase3 = start_phase3.elapsed();
     let duration_total = start_total.elapsed();
 
@@ -270,7 +292,7 @@ async fn parse_data_with_schema(
     Ok((rows_processed, record_batch))
 }
 
-// The core streaming parser logic
+// The core streaming parser logic - INSTRUMENTED
 async fn parse_binary_stream_static(
     mut stream: Pin<Box<CopyOutStream>>,
     parser: &mut SchemaParser,
@@ -280,54 +302,74 @@ async fn parse_binary_stream_static(
     let mut is_header_parsed: bool = false;
     let mut rows_processed: usize = 0;
 
-    'stream_loop: while let Some(segment_result) = stream.next().await {
-        let segment: Bytes = segment_result.context("Error reading segment from CopyOutStream")?;
-        buffer.extend_from_slice(&segment);
+    // NEW: Refactored loop to visualize Starvation vs Work
+    'stream_loop: loop {
 
-        if !is_header_parsed {
-            if buffer.len() < 19 { continue 'stream_loop; }
-            let mut header_cursor = Cursor::new(&buffer[..]);
-            parse_stream_header(&mut header_cursor).context("Failed to parse stream header")?;
-            buffer.advance(19);
-            is_header_parsed = true;
-        }
+        // 1. MEASURE STARVATION (Waiting for Network)
+        // Level::ERROR makes this show up nicely in filters/colors, visualizing the "gap"
+        let wait_span = span!(Level::ERROR, "IO_WAIT_STARVATION");
+        let guard = wait_span.enter();
 
-        'parsing_loop: loop {
-            let mut cursor = Cursor::new(&buffer[..]);
-            let safe_position = cursor.position();
+        let next_item = stream.next().await;
 
-            let col_count = match cursor.read_i16::<BigEndian>() {
-                Ok(count) => count,
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => { break 'parsing_loop; }
-                Err(e) => return Err(e.into()),
-            };
+        drop(guard); // Important: Drop guard immediately when data arrives!
 
-            if col_count == -1 {
-                buffer.advance(2);
-                break 'stream_loop;
+        match next_item {
+            Some(segment_result) => {
+                // 2. MEASURE WORK (CPU Parsing)
+                let work_span = span!(Level::INFO, "CPU_Parse_Chunk");
+                let _work_guard = work_span.enter();
+
+                let segment: Bytes = segment_result.context("Error reading segment from CopyOutStream")?;
+                buffer.extend_from_slice(&segment);
+
+                if !is_header_parsed {
+                    if buffer.len() < 19 { continue 'stream_loop; }
+                    let mut header_cursor = Cursor::new(&buffer[..]);
+                    parse_stream_header(&mut header_cursor).context("Failed to parse stream header")?;
+                    buffer.advance(19);
+                    is_header_parsed = true;
+                }
+
+                'parsing_loop: loop {
+                    let mut cursor = Cursor::new(&buffer[..]);
+                    let safe_position = cursor.position();
+
+                    let col_count = match cursor.read_i16::<BigEndian>() {
+                        Ok(count) => count,
+                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => { break 'parsing_loop; }
+                        Err(e) => return Err(e.into()),
+                    };
+
+                    if col_count == -1 {
+                        buffer.advance(2);
+                        break 'stream_loop;
+                    }
+
+                    match parse_row_static(&mut cursor, parser, buffer.as_ref()) {
+                        Ok(_) => {
+                            rows_processed += 1;
+                            let bytes_consumed = cursor.position();
+                            buffer.advance(bytes_consumed as usize);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                            cursor.set_position(safe_position);
+                            // Copy remaining bytes back to the buffer for the next chunk
+                            let remaining_slice = &buffer.as_ref()[safe_position as usize..];
+                            let mut leftover_buffer_vec = Vec::new();
+                            leftover_buffer_vec.extend_from_slice(remaining_slice);
+                            buffer.clear();
+                            buffer.extend_from_slice(&leftover_buffer_vec);
+
+                            break 'parsing_loop;
+                        }
+                        Err(e) => {
+                            return Err(e.into());
+                        }
+                    }
+                }
             }
-
-            match parse_row_static(&mut cursor, parser, buffer.as_ref()) {
-                Ok(_) => {
-                    rows_processed += 1;
-                    let bytes_consumed = cursor.position();
-                    buffer.advance(bytes_consumed as usize);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    cursor.set_position(safe_position);
-                    // Copy remaining bytes back to the buffer for the next chunk
-                    let remaining_slice = &buffer.as_ref()[safe_position as usize..];
-                    let mut leftover_buffer_vec = Vec::new();
-                    leftover_buffer_vec.extend_from_slice(remaining_slice);
-                    buffer.clear();
-                    buffer.extend_from_slice(&leftover_buffer_vec);
-
-                    break 'parsing_loop;
-                }
-                Err(e) => {
-                    return Err(e.into());
-                }
-            }
+            None => break 'stream_loop, // End of stream
         }
     }
 
