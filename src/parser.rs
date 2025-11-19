@@ -151,7 +151,14 @@ pub async fn run_db_logic(config: ConnectorConfig, blast_radius: i64) -> Result<
                 results[index] = Some(batch.1);
             }
             Err(e) => {
-                eprintln!("UncheckedIO: Partition {} failed! Error: {}. Falling back to NULLs (Self-Healing logic required here).", index, e);
+                // ERROR LOGGING
+                // We use tracing::error! here so it shows up brightly in the Tracy log view
+                tracing::error!(
+                    "Partition {} failed! Error: {}. Falling back to NULLs.",
+                    index, e
+                );
+                eprintln!("UncheckedIO: Partition {} failed! Error: {}. Falling back to NULLs.", index, e);
+
                 let null_batch = create_null_batch(arrow_schema.clone(), expected_rows)?;
                 results[index] = Some(null_batch);
             }
@@ -211,7 +218,9 @@ fn create_null_batch(schema: Arc<Schema>, num_rows: usize) -> Result<RecordBatch
 /// Helper function to build the Arrow Schema from the config
 fn build_arrow_schema(config: &ConnectorConfig) -> Result<Schema> {
     let schema_fields: Vec<Field> = config.schema.iter().map(|col_cfg| {
-        let nullable = col_cfg.column_name == "notes";
+        // FIX: Force all columns to be nullable.
+        // This allows our "Self-Healing" logic to insert NULLs if a partition fails.
+        let nullable = true;
 
         let arrow_type = match col_cfg.arrow_type.as_str() {
             "Int64" => DataType::Int64,
