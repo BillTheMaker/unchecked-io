@@ -23,6 +23,8 @@ use crate::config::{load_and_validate_config, ConnectorConfig};
 // NOTE: run_profiler_logic added, requires definition in parser.rs
 use crate::parser::{run_db_logic, run_profiler_logic};
 
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 // --- THE PYTHON-CALLABLE ENTRY POINT (Load Data) ---
 
@@ -90,6 +92,11 @@ fn profile_data(config_path: String) -> PyResult<String> {
 // --- PYTHON MODULE EXPORT ---
 #[pymodule]
 fn unchecked_io(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+
+    let _ = tracing_subscriber::registry()
+        .with(tracing_tracy::TracyLayer::new())
+        .try_init();
+
     m.add_function(wrap_pyfunction!(load_data_from_config, m)?)?;
     m.add_function(wrap_pyfunction!(to_pandas_dataframe, m)?)?;
     m.add_function(wrap_pyfunction!(profile_data, m)?)?; // NEW: Schema profiler
