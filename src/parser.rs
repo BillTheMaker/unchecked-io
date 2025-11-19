@@ -1,8 +1,8 @@
 // --- External Crates ---
 use std::pin::Pin;
 use std::sync::Arc;
-// FIX: Replace direct tokio_postgres connections with deadpool
 use tokio_postgres::{NoTls, CopyOutStream, Config as PgConfig};
+// Required for the connection pool
 use deadpool_postgres::{Pool, Manager, Runtime};
 use anyhow::{Context, Result, anyhow};
 use arrow::array::{
@@ -19,14 +19,14 @@ use bytes::{Bytes, BytesMut, Buf};
 use byteorder::{BigEndian, ReadBytesExt};
 use std::io::{Cursor, Read};
 use std::str;
-use chrono::{NaiveDateTime, NaiveDate};
-use std::mem;
 use std::str::FromStr;
+use chrono::{NaiveDateTime, NaiveDate};
+use std::time::Instant;
 use tokio::task::JoinSet;
 use arrow::compute::concat_batches;
 
 // --- Internal Crates ---
-use crate::config::ConnectorConfig;
+use crate::config::{ConnectorConfig, load_and_validate_config};
 
 
 // --- CONSTANTS ---
@@ -36,25 +36,26 @@ const POSTGRES_EPOCH_MICROS_OFFSET: i64 = 946684800000000;
 
 
 // --- 1. CORE DATABASE LOGIC (PARALLEL COORDINATOR) ---
-// Note: We use blast_radius from Python config as the partitioning strategy
+// This is the fully optimized function using Connection Pooling and Static Dispatch.
 pub async fn run_db_logic(config: ConnectorConfig, blast_radius: i64) -> Result<RecordBatch> {
+
+    // Start overall timer
+    let start_total = Instant::now();
+    let start_phase1 = Instant::now();
 
     println!("UncheckedIO: Starting Query Planner (Blast Radius: {})...", blast_radius);
 
-    // --- PHASE 1: SETUP CONNECTION POOL ---
+    // --- PHASE 1: SETUP CONNECTION POOL & STATS ---
     let pg_config: tokio_postgres::Config = PgConfig::from_str(&config.connection_string)
         .context("Invalid connection string in config")?;
 
-    // Initialize the Manager and Pool
     let manager = Manager::new(pg_config.clone(), NoTls);
-    // Set pool size higher than the expected partition count to ensure connections are always available.
     let pool = Pool::builder(manager)
         .max_size(20)
         .runtime(Runtime::Tokio1)
         .build()
         .context("Failed to build connection pool")?;
 
-    // 2. Query for Table Bounds (using pool connection)
     let client = pool.get().await.context("Failed to get pool connection for stats query")?;
     let partition_key = "id";
 
@@ -62,16 +63,14 @@ pub async fn run_db_logic(config: ConnectorConfig, blast_radius: i64) -> Result<
         .context("Failed to parse base query from config")?;
     let base_query_inner = base_query.trim().trim_start_matches("COPY (").trim_end_matches(")");
 
-    // NOTE: We rely on MIN/MAX here, assuming dense key for benchmark data.
     let stats_query = format!("SELECT MIN({}), MAX({}) FROM ({}) AS subquery", partition_key, partition_key, base_query_inner);
 
     let row = client.query_one(&stats_query, &[]).await?;
     let min_id: i64 = row.try_get(0).context("Failed to get MIN(id)")?;
     let max_id: i64 = row.try_get(1).context("Failed to get MAX(id)")?;
-    // Connection is returned to the pool when 'client' is dropped here.
+
     println!("UncheckedIO: ID Range: {} to {}", min_id, max_id);
 
-    // 4. Generate Partitioned Queries (Based on blast_radius from Python)
     struct PartitionTask {
         index: usize,
         query: String,
@@ -95,25 +94,27 @@ pub async fn run_db_logic(config: ConnectorConfig, blast_radius: i64) -> Result<
         idx += 1;
     }
     println!("UncheckedIO: Generated {} parallel partitions.", partitions.len());
+    let duration_phase1 = start_phase1.elapsed();
 
-    // --- Phase 2: Parallel Execution ---
+
+    // --- PHASE 2: PARALLEL EXECUTION (DATA TRANSFER + PARSING) ---
+    let start_phase2 = Instant::now();
+
     let arrow_schema = Arc::new(build_arrow_schema(&config)?);
     let mut join_set = JoinSet::new();
 
     for task in partitions {
-        let worker_pool = pool.clone(); // Pass the pool handle
+        let worker_pool = pool.clone();
         let worker_schema = arrow_schema.clone();
 
         join_set.spawn(async move {
             let worker_logic = async {
-                // Get connection from pool (This is the speedup)
                 let worker_client = worker_pool.get().await
                     .context("Worker: Failed to get pool connection")?;
 
                 let copy_stream = worker_client.copy_out(task.query.as_str()).await?;
                 let pinned_stream: Pin<Box<CopyOutStream>> = Box::pin(copy_stream);
 
-                // Call the static dispatch parser
                 parse_data_with_schema(pinned_stream, worker_schema).await
             };
 
@@ -122,7 +123,7 @@ pub async fn run_db_logic(config: ConnectorConfig, blast_radius: i64) -> Result<
         });
     }
 
-    // --- Phase 3: Collect, Order, and Stitch ---
+    // Collect results
     let mut results: Vec<Option<RecordBatch>> = vec![None; idx];
 
     while let Some(join_result) = join_set.join_next().await {
@@ -133,24 +134,47 @@ pub async fn run_db_logic(config: ConnectorConfig, blast_radius: i64) -> Result<
                 results[index] = Some(batch.1);
             }
             Err(e) => {
-                // --- Self-Healing Placeholder ---
                 eprintln!("UncheckedIO: Partition {} failed! Error: {}. Falling back to NULLs (Self-Healing logic required here).", index, e);
                 let null_batch = create_null_batch(arrow_schema.clone(), expected_rows)?;
                 results[index] = Some(null_batch);
             }
         }
     }
+    let duration_phase2 = start_phase2.elapsed();
+
+
+    // --- PHASE 3: CONCATENATION AND FINALIZATION ---
+    let start_phase3 = Instant::now();
 
     let batches: Vec<RecordBatch> = results.into_iter()
         .filter_map(|b| b)
         .collect();
 
     if batches.is_empty() {
+        println!("UncheckedIO: All workers returned empty batches.");
+        let duration_total = start_total.elapsed();
+        println!("--- UncheckedIO Internal Timing ---");
+        println!("Phase 1 (Setup, Query): {:.2?}", duration_phase1);
+        println!("Phase 2 (I/O, Parsing): {:.2?}", duration_phase2);
+        println!("Phase 3 (Concatenation): {:.2?}", start_phase3.elapsed());
+        println!("Total Wall Time: {:.2?}", duration_total);
         return Ok(RecordBatch::new_empty(arrow_schema));
     }
 
     let final_batch = concat_batches(&arrow_schema, &batches)
         .context("Failed to concatenate parallel batches")?;
+
+    let duration_phase3 = start_phase3.elapsed();
+    let duration_total = start_total.elapsed();
+
+
+    // --- FINAL REPORTING ---
+    println!("--- UncheckedIO Internal Timing ---");
+    println!("Phase 1 (Setup, Query): {:.2?}", duration_phase1);
+    println!("Phase 2 (I/O, Parsing): {:.2?}", duration_phase2);
+    println!("Phase 3 (Concatenation): {:.2?}", duration_phase3);
+    println!("Total Wall Time: {:.2?}", duration_total);
+
 
     Ok(final_batch)
 }
@@ -165,7 +189,7 @@ fn create_null_batch(schema: Arc<Schema>, num_rows: usize) -> Result<RecordBatch
 /// Helper function to build the Arrow Schema from the config
 fn build_arrow_schema(config: &ConnectorConfig) -> Result<Schema> {
     let schema_fields: Vec<Field> = config.schema.iter().map(|col_cfg| {
-        let nullable = col_cfg.column_name == "notes"; // Hack for MVP
+        let nullable = col_cfg.column_name == "notes";
 
         let arrow_type = match col_cfg.arrow_type.as_str() {
             "Int64" => DataType::Int64,
@@ -409,4 +433,75 @@ fn read_string_field(
     cursor.set_position(end as u64); // Manually advance cursor
 
     Ok(())
+}
+
+// --------------------------------------------------------------------------------
+// --- 3. PROFILER LOGIC (New Feature) ---
+// --------------------------------------------------------------------------------
+
+/// Maps a PostgreSQL internal type name to a standard Arrow Type string for config.yaml.
+fn map_postgres_to_arrow_type(pg_type_name: &str) -> Option<&'static str> {
+    match pg_type_name {
+        "int8" | "bigint" | "serial8" => Some("Int64"),
+        "int4" | "integer" | "serial" => Some("Int32"),
+        "float8" | "double precision" => Some("Float64"),
+        "float4" | "real" => Some("Float32"),
+        "varchar" | "text" | "uuid" => Some("Utf8"),
+        "bool" | "boolean" => Some("Boolean"),
+        "timestamptz" | "timestamp" => Some("Timestamp(Nanosecond, None)"),
+        "date" => Some("Date32"),
+        _ => None, // Returns None for unsupported types (like JSON, arrays, etc.)
+    }
+}
+
+pub async fn run_profiler_logic(config_path: &str) -> Result<String> {
+    // Phase 1: Load config to get connection string and query
+    let config: ConnectorConfig = load_and_validate_config(config_path)
+        .context("Failed to load and validate config for profiling")?;
+
+    // Use a non-COPY query to get metadata
+    let (base_query, _) = config.query.trim().split_once("TO STDOUT (FORMAT binary)")
+        .context("Query in config is malformed or not a COPY command")?;
+
+    // We only need the base query for the metadata query
+    let base_query_inner = base_query.trim().trim_start_matches("COPY (").trim_end_matches(")");
+
+    // Construct the metadata query (limit 0 is fastest)
+    let metadata_query = format!("SELECT * FROM ({}) AS subquery LIMIT 0", base_query_inner);
+
+    // Phase 2: Connect and execute the query
+    let pg_config: PgConfig = PgConfig::from_str(&config.connection_string)?;
+    let (client, connection) = pg_config.connect(NoTls).await
+        .context("Profiler: Failed to connect to PostgreSQL")?;
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await { eprintln!("Profiler connection error: {}", e); }
+    });
+
+    let statement = client.prepare(&metadata_query).await
+        .context("Profiler: Failed to prepare metadata query")?;
+
+    let mut output = String::from("schema:\n");
+
+    // Phase 3: Inspect the statement's columns for metadata
+    for column in statement.columns() {
+        let pg_type_name = column.type_().name().to_lowercase();
+        let arrow_type = map_postgres_to_arrow_type(&pg_type_name)
+            .unwrap_or("UNKNOWN (Review Manually)");
+
+        let column_entry = format!(
+            "- arrow_type: {}\n  column_name: {}\n",
+            arrow_type,
+            column.name()
+        );
+        output.push_str(&column_entry);
+    }
+
+    // Final instructions for the user
+    output.push_str("\n# NOTE: Paste the 'schema' block above into your config.yaml\n");
+    output.push_str(
+        "# REVIEW any UNKNOWN types. PostgreSQL types: (int8, float8, text, bool, timestamp, date, etc.)\n"
+    );
+
+    Ok(output)
 }

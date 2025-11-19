@@ -9,9 +9,7 @@ use tokio;
 use pyo3::types::{PyModule, PyAny};
 use pyo3::Bound;
 use pyo3_arrow::PyRecordBatch;
-
-// Use the high-performance mimalloc for better multi-threaded memory allocation.
-// We conditionally compile it to avoid issues on MSVC targets.
+// Required for global allocator (mimalloc)
 #[cfg(not(target_env = "msvc"))]
 use mimalloc;
 
@@ -19,12 +17,14 @@ use mimalloc;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+
 // --- Internal Crates ---
 use crate::config::{load_and_validate_config, ConnectorConfig};
-use crate::parser::run_db_logic;
+// NOTE: run_profiler_logic added, requires definition in parser.rs
+use crate::parser::{run_db_logic, run_profiler_logic};
 
 
-// --- THE PYTHON-CALLABLE ENTRY POINT ---
+// --- THE PYTHON-CALLABLE ENTRY POINT (Load Data) ---
 
 #[pyfunction]
 #[pyo3(signature = (config_path, blast_radius=312500))]
@@ -37,7 +37,6 @@ fn load_data_from_config<'py>(
     blast_radius: i64,
 ) -> PyResult<Bound<'py, PyAny>> {
 
-    // --- Phase 1: Load and Validate Configuration ---
     let config: ConnectorConfig = match load_and_validate_config(&config_path) {
         Ok(c) => c,
         Err(e) => return Err(PyValueError::new_err(format!("Configuration Error: {:?}", e))),
@@ -47,7 +46,6 @@ fn load_data_from_config<'py>(
     println!("Database: {}", config.connection_string);
     println!("Columns (in order): {:?}", config.schema.iter().map(|c| &c.column_name).collect::<Vec<_>>());
 
-    // --- Phase 2: Run Core Logic ---
     let record_batch = py.allow_threads(|| {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -58,16 +56,42 @@ fn load_data_from_config<'py>(
             })
     }).map_err(|e| PyValueError::new_err(format!("Database/Runtime Error: {:?}", e)))?;
 
-    // --- Phase 3: Return Data to Python ---
     let py_record_batch = PyRecordBatch::new(record_batch);
     py_record_batch.into_pyarrow(py)
 }
 
+// --- NEW PYTHON-CALLABLE FUNCTION FOR PANDAS CONVERSION (FIXED SIGNATURE) ---
+#[pyfunction]
+#[pyo3(signature = (arrow_table))] // FIX: Removed 'py' from the signature macro
+fn to_pandas_dataframe<'py>(py: Python<'py>, arrow_table: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    // This calls the 'to_pandas' method on the PyArrow object.
+    arrow_table.call_method0("to_pandas")
+}
+
+// --- NEW PYTHON-CALLABLE ENTRY POINT FOR SCHEMA PROFILING ---
+#[pyfunction]
+#[pyo3(signature = (config_path))]
+fn profile_data(config_path: String) -> PyResult<String> {
+    // Note: The profiler uses a small, current_thread tokio runtime since it's sequential I/O.
+    let output = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                run_profiler_logic(&config_path).await
+            })
+    }).join().unwrap().map_err(|e| PyValueError::new_err(format!("Profiling Error: {:?}", e)))?;
+
+    Ok(output)
+}
+
 
 // --- PYTHON MODULE EXPORT ---
-
 #[pymodule]
 fn unchecked_io(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(load_data_from_config, m)?)?;
+    m.add_function(wrap_pyfunction!(to_pandas_dataframe, m)?)?;
+    m.add_function(wrap_pyfunction!(profile_data, m)?)?; // NEW: Schema profiler
     Ok(())
 }
