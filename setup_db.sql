@@ -39,5 +39,6 @@ SELECT
 FROM generate_series(1, 20000000) s(i);
 
 -- 4. Analyze the table for better query planning (good practice)
+CREATE INDEX idx_benchmark_id ON benchmark_table(id);
 ANALYZE benchmark_table;
 
