@@ -8,7 +8,10 @@ use pyo3::exceptions::PyValueError;
 use tokio;
 use pyo3::types::{PyModule, PyAny};
 use pyo3::Bound;
-use pyo3_arrow::PyRecordBatch;
+
+// FIX: Use the export path you confirmed works in your IDE
+use pyo3_arrow::export::Arro3RecordBatch;
+
 // Required for global allocator (mimalloc)
 #[cfg(not(target_env = "msvc"))]
 use mimalloc;
@@ -23,15 +26,17 @@ use crate::config::{load_and_validate_config, ConnectorConfig};
 // NOTE: run_profiler_logic added, requires definition in parser.rs
 use crate::parser::{run_db_logic, run_profiler_logic};
 
-// NEW: Import the tracing libraries we need for the initialization
+// NEW: Import the tracing libraries only if feature is enabled
+#[cfg(feature = "profiling")]
 use tracing_subscriber::layer::SubscriberExt;
+#[cfg(feature = "profiling")]
 use tracing_subscriber::util::SubscriberInitExt;
 
 
 // --- THE PYTHON-CALLABLE ENTRY POINT (Load Data) ---
 
 #[pyfunction]
-#[pyo3(signature = (config_path, blast_radius=312500))]
+#[pyo3(signature = (config_path, blast_radius=0))] // Default to 0 for auto-tuning
 #[allow(unsafe_code)]
 #[allow(unsafe_op_in_unsafe_fn)]
 #[allow(rust_2024_compatibility)]
@@ -50,6 +55,8 @@ fn load_data_from_config<'py>(
     println!("Database: {}", config.connection_string);
     println!("Columns (in order): {:?}", config.schema.iter().map(|c| &c.column_name).collect::<Vec<_>>());
 
+    // FIX: Handle GIL release properly to avoid deprecation warnings if possible,
+    // but primarily ensure the logic works with the new Arro3RecordBatch wrapper.
     let record_batch = py.allow_threads(|| {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -60,8 +67,10 @@ fn load_data_from_config<'py>(
             })
     }).map_err(|e| PyValueError::new_err(format!("Database/Runtime Error: {:?}", e)))?;
 
-    let py_record_batch = PyRecordBatch::new(record_batch);
-    py_record_batch.into_pyarrow(py)
+    // FIX: Use Arro3RecordBatch::from() instead of new()
+    // This uses the standard From trait conversion.
+    let py_record_batch = Arro3RecordBatch::from(record_batch);
+    py_record_batch.into_pyobject(py)
 }
 
 // --- NEW PYTHON-CALLABLE FUNCTION FOR PANDAS CONVERSION (FIXED SIGNATURE) ---
@@ -94,16 +103,18 @@ fn profile_data(config_path: String) -> PyResult<String> {
 // --- PYTHON MODULE EXPORT ---
 #[pymodule]
 fn unchecked_io(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // --- START NEW CODE ---
-    // This tries to initialize the "Tracy" layer.
-    // The '.try_init()' ensures that if you import the library twice (e.g. in a notebook reload),
-    // it doesn't crash by trying to initialize the global logger a second time.
 
-    // Fix: Use 'default()' instead of 'new()' to avoid argument mismatch errors
-    let _ = tracing_subscriber::registry()
-        .with(tracing_tracy::TracyLayer::default())
-        .try_init();
-    // --- END NEW CODE ---
+    // NEW: Only initialize Tracy if the feature is enabled
+    #[cfg(feature = "profiling")]
+    {
+        // Use 'default()' instead of 'new()' to avoid argument mismatch errors
+        // The .try_init() prevents crashing on module reloads (e.g. Jupyter)
+        let _ = tracing_subscriber::registry()
+            .with(tracing_tracy::TracyLayer::default())
+            .try_init();
+
+        println!("UncheckedIO: Profiling Mode ENABLED 🚀");
+    }
 
     m.add_function(wrap_pyfunction!(load_data_from_config, m)?)?;
     m.add_function(wrap_pyfunction!(to_pandas_dataframe, m)?)?;

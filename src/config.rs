@@ -1,7 +1,6 @@
 // --- External Crates ---
 use serde::Deserialize;
-use std::collections::HashMap;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result}; // Removed unused 'anyhow' macro import if not used, but Context/Result likely used
 use std::fmt::{self, Display};
 
 // --- 1. CUSTOM ERROR DEFINITION ---
@@ -29,7 +28,7 @@ pub struct ColumnConfig {
 #[derive(Debug, Deserialize)]
 pub struct ConnectorConfig {
     pub connection_string: String,
-    pub query: String, // <--- ADD THIS FIELD
+    pub query: String,
     pub schema: Vec<ColumnConfig>,
 }
 

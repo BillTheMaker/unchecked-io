@@ -16,7 +16,7 @@ DB_PORT = "5433" # <-- Your local Docker port
 DB_NAME = "postgres"
 
 # Global Configuration
-BLAST_RADIUS = 125000 # Rows per parallel task (1M / 62500 = 16 partitions)
+BLAST_RADIUS = 312500 # Rows per parallel task (1M / 62500 = 16 partitions)
 
 # SQLAlchemy connection string (for Pandas)
 sqlalchemy_conn_str = f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
