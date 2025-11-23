@@ -1823,7 +1823,6 @@ dependencies = [
  "byteorder",
  "bytes",
  "chrono",
- "chrono-tz",
  "deadpool-postgres",
  "futures-util",
  "mimalloc",
