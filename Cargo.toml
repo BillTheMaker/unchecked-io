@@ -1,6 +1,6 @@
 [package]
 name = "unchecked-io"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Billthemaker"] # Replace with your name or alias
 license = "BSL-1" # Good practice for open-source
 edition = "2024"
