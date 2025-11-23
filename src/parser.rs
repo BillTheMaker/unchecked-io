@@ -24,7 +24,10 @@ use chrono::{NaiveDateTime, NaiveDate};
 use std::time::Instant;
 use tokio::task::JoinSet;
 use arrow::compute::concat_batches;
-// NEW: Tracing macros for profiling
+// NEW: For the Work Stealing Queue
+use async_channel;
+// NEW: Tracing macros for profiling - Only import if feature is enabled
+#[cfg(feature = "profiling")]
 use tracing::{span, Level};
 
 // --- Internal Crates ---
@@ -37,7 +40,7 @@ use crate::config::{ConnectorConfig, load_and_validate_config};
 const POSTGRES_EPOCH_MICROS_OFFSET: i64 = 946684800000000;
 
 
-// --- 1. CORE DATABASE LOGIC (PARALLEL COORDINATOR) ---
+// --- 1. CORE DATABASE LOGIC (WORKER POOL PATTERN) ---
 // This is the fully optimized function using Connection Pooling and Static Dispatch.
 pub async fn run_db_logic(config: ConnectorConfig, blast_radius: i64) -> Result<RecordBatch> {
 
@@ -46,25 +49,35 @@ pub async fn run_db_logic(config: ConnectorConfig, blast_radius: i64) -> Result<
     let start_phase1 = Instant::now();
 
     // NEW: High-level span for the whole operation
+    #[cfg(feature = "profiling")]
     let root_span = span!(Level::INFO, "UncheckedIO_Run");
+    #[cfg(feature = "profiling")]
     let _root_guard = root_span.enter();
 
-    println!("UncheckedIO: Starting Query Planner (Blast Radius: {})...", blast_radius);
-
     // --- PHASE 1: SETUP CONNECTION POOL & STATS ---
+    #[cfg(feature = "profiling")]
     let phase1_span = span!(Level::INFO, "Phase1_Setup");
+    #[cfg(feature = "profiling")]
     let _p1_guard = phase1_span.enter();
 
+    // 1. Calculate Worker Count (Fixed Parallelism)
+    let num_workers = num_cpus::get();
+    println!("UncheckedIO: Detected {} logical cores. Spawning {} worker threads.", num_workers, num_workers);
+
+    // 2. Setup Connection Pool
     let pg_config: tokio_postgres::Config = PgConfig::from_str(&config.connection_string)
         .context("Invalid connection string in config")?;
 
     let manager = Manager::new(pg_config.clone(), NoTls);
+    // FIX: Set pool size exactly to num_workers to prevent starvation or waiting
     let pool = Pool::builder(manager)
-        .max_size(20)
+        .max_size(num_workers)
         .runtime(Runtime::Tokio1)
         .build()
         .context("Failed to build connection pool")?;
 
+    // 3. Query Table Bounds
+    // We grab a temporary connection just for this setup phase
     let client = pool.get().await.context("Failed to get pool connection for stats query")?;
     let partition_key = "id";
 
@@ -77,108 +90,168 @@ pub async fn run_db_logic(config: ConnectorConfig, blast_radius: i64) -> Result<
     let row = client.query_one(&stats_query, &[]).await?;
     let min_id: i64 = row.try_get(0).context("Failed to get MIN(id)")?;
     let max_id: i64 = row.try_get(1).context("Failed to get MAX(id)")?;
+    drop(client); // Return connection to pool immediately
 
     println!("UncheckedIO: ID Range: {} to {}", min_id, max_id);
 
+    // --- NEW: DYNAMIC PARTITION SIZING ---
+    let total_rows = (max_id - min_id + 1).max(1);
+    let calculated_blast_radius = if blast_radius <= 0 {
+        // Auto-tuning: Aim for ~4 chunks per worker to balance load
+        let target_chunks = (num_workers * 4) as i64;
+        let dynamic_size = total_rows / target_chunks;
+        // Ensure a sane minimum (e.g., don't make chunks of 1 row)
+        let size = dynamic_size.max(10_000);
+        println!("UncheckedIO: Auto-tuned partition size to {} rows (Targeting {} chunks).", size, target_chunks);
+        size
+    } else {
+        println!("UncheckedIO: Using user-defined partition size: {} rows.", blast_radius);
+        blast_radius
+    };
+
+
+    // 4. Create Work Queue
+    // We use a tuple: (index, query, expected_rows) so we can re-sort later
     struct PartitionTask {
         index: usize,
         query: String,
         expected_rows: usize
     }
 
-    let mut partitions: Vec<PartitionTask> = Vec::new();
+    // Create an unbounded channel. 
+    // tx = transmitter (main thread), rx = receiver (workers)
+    let (tx, rx) = async_channel::unbounded::<PartitionTask>();
+
+    // 5. Populate the Queue (The "Blast Radius" Logic)
     let mut current_min = min_id;
     let mut idx = 0;
+    let mut total_partitions = 0;
 
     while current_min <= max_id {
-        let current_max = (current_min + blast_radius - 1).min(max_id);
+        let current_max = (current_min + calculated_blast_radius - 1).min(max_id);
         let new_query = format!(
             "COPY (SELECT * FROM ({}) AS sub WHERE {} BETWEEN {} AND {}) TO STDOUT (FORMAT binary)",
             base_query_inner, partition_key, current_min, current_max
         );
         let estimated_rows = (current_max - current_min + 1) as usize;
 
-        partitions.push(PartitionTask { index: idx, query: new_query, expected_rows: estimated_rows });
-        current_min += blast_radius;
-        idx += 1;
-    }
-    println!("UncheckedIO: Generated {} parallel partitions.", partitions.len());
+        // FIX: Removed 'partitions.push(...)' which caused the error.
+        // We send directly to the channel now.
+        let task = PartitionTask { index: idx, query: new_query, expected_rows: estimated_rows };
 
+        // Send to queue (non-blocking since it's unbounded)
+        tx.send(task).await.context("Failed to fill work queue")?;
+
+        current_min += calculated_blast_radius;
+        idx += 1;
+        total_partitions += 1;
+    }
+    // Close the channel so workers know when to stop
+    tx.close();
+
+    println!("UncheckedIO: Queued {} partitions for processing.", total_partitions);
+
+    #[cfg(feature = "profiling")]
     drop(_p1_guard); // End Phase 1 Span
     let duration_phase1 = start_phase1.elapsed();
 
 
     // --- PHASE 2: PARALLEL EXECUTION (DATA TRANSFER + PARSING) ---
     let start_phase2 = Instant::now();
+    #[cfg(feature = "profiling")]
     let phase2_span = span!(Level::INFO, "Phase2_Execution");
+    #[cfg(feature = "profiling")]
     let _p2_guard = phase2_span.enter();
 
     let arrow_schema = Arc::new(build_arrow_schema(&config)?);
     let mut join_set = JoinSet::new();
 
-    for task in partitions {
+    // Spawn exactly 'num_workers' long-lived tasks
+    for worker_id in 0..num_workers {
+        let worker_rx = rx.clone();
         let worker_pool = pool.clone();
         let worker_schema = arrow_schema.clone();
 
         join_set.spawn(async move {
-            let worker_logic = async {
-                // Instrument each worker thread so they show up as separate tracks in Tracy
-                let worker_span = span!(Level::INFO, "Worker_Thread", id = task.index);
-                let _w_guard = worker_span.enter();
+            // VISUALIZATION: Create a "track" for this worker in Tracy
+            #[cfg(feature = "profiling")]
+            let worker_span = span!(Level::INFO, "Worker_Thread", id = worker_id);
+            #[cfg(feature = "profiling")]
+            let _w_guard = worker_span.enter();
 
-                let worker_client = worker_pool.get().await
-                    .context("Worker: Failed to get pool connection")?;
+            let mut worker_batches: Vec<(usize, RecordBatch)> = Vec::new();
 
-                let copy_stream = worker_client.copy_out(task.query.as_str()).await?;
-                let pinned_stream: Pin<Box<CopyOutStream>> = Box::pin(copy_stream);
+            // Worker Loop: Keep grabbing tasks until the queue is empty and closed
+            while let Ok(task) = worker_rx.recv().await {
 
-                parse_data_with_schema(pinned_stream, worker_schema).await
-            };
+                // VISUALIZATION: Show exactly which partition is being processed
+                #[cfg(feature = "profiling")]
+                let task_span = span!(Level::INFO, "Processing_Task", partition_id = task.index);
+                #[cfg(feature = "profiling")]
+                let _t_guard = task_span.enter();
 
-            let result = worker_logic.await;
-            (task.index, result, task.expected_rows)
+                // Process the task
+                // We wrap this in an inner block to easily catch errors for Self-Healing
+                let result = async {
+                    let client = worker_pool.get().await.context("Pool exhausted")?;
+                    let copy_stream = client.copy_out(task.query.as_str()).await?;
+                    let pinned_stream: Pin<Box<CopyOutStream>> = Box::pin(copy_stream);
+
+                    // Call Static Dispatch Parser
+                    parse_data_with_schema(pinned_stream, worker_schema.clone()).await
+                }.await;
+
+                match result {
+                    Ok((_rows, batch)) => {
+                        worker_batches.push((task.index, batch));
+                    }
+                    Err(e) => {
+                        // ERROR LOGGING
+                        #[cfg(feature = "profiling")]
+                        tracing::error!("Worker {}: Partition {} failed! Error: {}", worker_id, task.index, e);
+
+                        // --- SELF-HEALING LOGIC ---
+                        // If a partition fails (e.g. bad data), we log it and return NULLs
+                        eprintln!("UncheckedIO Worker {}: Partition {} failed! Error: {}. Filling NULLs.", worker_id, task.index, e);
+                        let null_batch = create_null_batch(worker_schema.clone(), task.expected_rows)?;
+                        worker_batches.push((task.index, null_batch));
+                    }
+                }
+            }
+
+            // Return all batches processed by this worker
+            Ok::<Vec<(usize, RecordBatch)>, anyhow::Error>(worker_batches)
         });
     }
 
-    // Collect results
-    let mut results: Vec<Option<RecordBatch>> = vec![None; idx];
+    // --- PHASE 3: AGGREGATION ---
+    let mut all_results: Vec<(usize, RecordBatch)> = Vec::with_capacity(total_partitions);
 
     while let Some(join_result) = join_set.join_next().await {
-        let (index, parse_result, expected_rows) = join_result.context("Worker thread panic")?;
-
-        match parse_result {
-            Ok(batch) => {
-                results[index] = Some(batch.1);
+        match join_result {
+            Ok(worker_result) => {
+                match worker_result {
+                    Ok(batches) => all_results.extend(batches),
+                    Err(e) => return Err(anyhow!("Worker task failed internally: {}", e)),
+                }
             }
-            Err(e) => {
-                // ERROR LOGGING
-                // We use tracing::error! here so it shows up brightly in the Tracy log view
-                tracing::error!(
-                    "Partition {} failed! Error: {}. Falling back to NULLs.",
-                    index, e
-                );
-                eprintln!("UncheckedIO: Partition {} failed! Error: {}. Falling back to NULLs.", index, e);
-
-                let null_batch = create_null_batch(arrow_schema.clone(), expected_rows)?;
-                results[index] = Some(null_batch);
-            }
+            Err(e) => return Err(anyhow!("Worker task panic: {}", e)),
         }
     }
 
+    #[cfg(feature = "profiling")]
     drop(_p2_guard); // End Phase 2 Span
     let duration_phase2 = start_phase2.elapsed();
 
 
     // --- PHASE 3: CONCATENATION AND FINALIZATION ---
     let start_phase3 = Instant::now();
+    #[cfg(feature = "profiling")]
     let phase3_span = span!(Level::INFO, "Phase3_Concat");
+    #[cfg(feature = "profiling")]
     let _p3_guard = phase3_span.enter();
 
-    let batches: Vec<RecordBatch> = results.into_iter()
-        .filter_map(|b| b)
-        .collect();
-
-    if batches.is_empty() {
+    if all_results.is_empty() {
         println!("UncheckedIO: All workers returned empty batches.");
         let duration_total = start_total.elapsed();
         println!("--- UncheckedIO Internal Timing ---");
@@ -189,9 +262,17 @@ pub async fn run_db_logic(config: ConnectorConfig, blast_radius: i64) -> Result<
         return Ok(RecordBatch::new_empty(arrow_schema));
     }
 
-    let final_batch = concat_batches(&arrow_schema, &batches)
-        .context("Failed to concatenate parallel batches")?;
+    // 1. Sort by index to restore original table order
+    all_results.sort_by_key(|(index, _)| *index);
 
+    // 2. Strip indices
+    let batches: Vec<RecordBatch> = all_results.into_iter().map(|(_, batch)| batch).collect();
+
+    // 3. Final Concatenation
+    let final_batch = concat_batches(&arrow_schema, &batches)
+        .context("Failed to stitch final batches")?;
+
+    #[cfg(feature = "profiling")]
     drop(_p3_guard); // End Phase 3 Span
     let duration_phase3 = start_phase3.elapsed();
     let duration_total = start_total.elapsed();
@@ -218,8 +299,7 @@ fn create_null_batch(schema: Arc<Schema>, num_rows: usize) -> Result<RecordBatch
 /// Helper function to build the Arrow Schema from the config
 fn build_arrow_schema(config: &ConnectorConfig) -> Result<Schema> {
     let schema_fields: Vec<Field> = config.schema.iter().map(|col_cfg| {
-        // FIX: Force all columns to be nullable.
-        // This allows our "Self-Healing" logic to insert NULLs if a partition fails.
+        // FIX: Force all columns to be nullable for safety
         let nullable = true;
 
         let arrow_type = match col_cfg.arrow_type.as_str() {
@@ -315,18 +395,22 @@ async fn parse_binary_stream_static(
     'stream_loop: loop {
 
         // 1. MEASURE STARVATION (Waiting for Network)
-        // Level::ERROR makes this show up nicely in filters/colors, visualizing the "gap"
+        #[cfg(feature = "profiling")]
         let wait_span = span!(Level::ERROR, "IO_WAIT_STARVATION");
+        #[cfg(feature = "profiling")]
         let guard = wait_span.enter();
 
         let next_item = stream.next().await;
 
+        #[cfg(feature = "profiling")]
         drop(guard); // Important: Drop guard immediately when data arrives!
 
         match next_item {
             Some(segment_result) => {
                 // 2. MEASURE WORK (CPU Parsing)
+                #[cfg(feature = "profiling")]
                 let work_span = span!(Level::INFO, "CPU_Parse_Chunk");
+                #[cfg(feature = "profiling")]
                 let _work_guard = work_span.enter();
 
                 let segment: Bytes = segment_result.context("Error reading segment from CopyOutStream")?;

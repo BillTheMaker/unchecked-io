@@ -11,8 +11,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # 1. Python Bindings for FFI
-pyo3 = { version = "0.27.1", features = ["extension-module", "chrono-tz"] }
-
+pyo3 = { version = "0.27.1", features = ["extension-module"] }
 chrono-tz = "0.10"
 
 # 2. Configuration Parsing (YAML)
@@ -25,6 +24,7 @@ arrow = "57.0.0"
 
 # 4. Asynchronous Runtime (Essential for I/O and Postgres)
 tokio = { version = "1.37", features = ["full"] }
+
 
 # 5. Database Connection (Postgres)
 tokio-postgres = "0.7"
@@ -54,9 +54,13 @@ pyo3-arrow = "0.15.0"
 # 13. System CPU Count (NEW)
 num_cpus = "1.16"
 
-tracing-subscriber = { version = "0.3", features = ["registry", "env-filter"] }
-tracing-tracy = "=0.11.2"
-tracing = "0.1.41"
+tracing-subscriber = { version = "0.3", features = ["registry", "env-filter"], optional = true}
+tracing-tracy = { version = "=0.11.2", optional = true }
+tracing = {version ="0.1.41", optional = true }
+
+async-channel = "2.5.0"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 mimalloc = { version = "0.1.39" }
+
+async-channel = "2.3"
