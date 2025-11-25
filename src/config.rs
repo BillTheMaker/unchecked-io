@@ -1,9 +1,7 @@
-// --- External Crates ---
+// src/config.rs
 use serde::Deserialize;
-use anyhow::{Context, Result}; // Removed unused 'anyhow' macro import if not used, but Context/Result likely used
+use anyhow::{Context, Result, anyhow};
 use std::fmt::{self, Display};
-
-// --- 1. CUSTOM ERROR DEFINITION ---
 
 #[derive(Debug)]
 pub struct ConfigError(String);
@@ -14,10 +12,6 @@ impl Display for ConfigError {
     }
 }
 impl std::error::Error for ConfigError {}
-
-
-// --- 2. CONFIGURATION STRUCTS (The "Configured Opinion") ---
-// We make these 'pub' (public) so src/lib.rs can use them.
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ColumnConfig {
@@ -30,10 +24,10 @@ pub struct ConnectorConfig {
     pub connection_string: String,
     pub query: String,
     pub schema: Vec<ColumnConfig>,
+    // NEW: Optional Batch Size configuration
+    pub batch_size: Option<usize>,
 }
 
-// --- 3. CONFIG LOADING FUNCTION ---
-// This is also 'pub' so src/lib.rs can call it.
 pub fn load_and_validate_config(path: &str) -> Result<ConnectorConfig> {
     let file_content = std::fs::read_to_string(path)
         .context(format!("Failed to read config file at path: {}", path))?;
@@ -47,7 +41,6 @@ pub fn load_and_validate_config(path: &str) -> Result<ConnectorConfig> {
     if config.query.is_empty() {
         return Err(ConfigError("Query cannot be empty.".to_string())).map_err(anyhow::Error::from)?;
     }
-    // FIX: Make the COPY check more flexible (allows newlines)
     let uppercase_query = config.query.trim().to_uppercase();
     if !uppercase_query.starts_with("COPY") || !uppercase_query.contains("TO STDOUT") || !uppercase_query.contains("FORMAT BINARY") {
         return Err(ConfigError("Query must be a 'COPY ... TO STDOUT (FORMAT binary)' command.".to_string())).map_err(anyhow::Error::from)?;
