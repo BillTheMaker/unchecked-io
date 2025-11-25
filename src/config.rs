@@ -1,6 +1,6 @@
 // src/config.rs
 use serde::Deserialize;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow}; // Added anyhow macro just in case
 use std::fmt::{self, Display};
 
 #[derive(Debug)]

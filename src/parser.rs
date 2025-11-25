@@ -127,6 +127,9 @@ pub async fn run_db_logic(config: ConnectorConfig, blast_radius: i64) -> Result<
     #[cfg(feature = "profiling")]
     drop(_p1_guard);
 
+    // FIX: Define the duration variable here so it can be used in the print statement later
+    let duration_phase1 = start_phase1.elapsed();
+
 
     // --- PHASE 2: PARALLEL EXECUTION (WITH AGGREGATION) ---
     let start_phase2 = Instant::now();
@@ -170,7 +173,6 @@ pub async fn run_db_logic(config: ConnectorConfig, blast_radius: i64) -> Result<
                     let pinned_stream: Pin<Box<CopyOutStream>> = Box::pin(copy_stream);
 
                     // Parse DIRECTLY into the persistent parser
-                    // Note: We changed the signature of parse_binary_stream_static to take &mut usize
                     parse_binary_stream_static(pinned_stream, &mut parser).await
                 }.await;
 
@@ -193,7 +195,6 @@ pub async fn run_db_logic(config: ConnectorConfig, blast_radius: i64) -> Result<
                         // SAFETY FLUSH: If we have pending data, flush it first!
                         if parser_row_count > 0 {
                             let batch = flush_parser(&mut parser, worker_schema.clone())?;
-                            // We associate this flush with the current task index for sorting
                             worker_batches.push((task.index, batch));
                             parser_row_count = 0;
                             parser = create_parser();
@@ -209,7 +210,6 @@ pub async fn run_db_logic(config: ConnectorConfig, blast_radius: i64) -> Result<
             // FINAL FLUSH: Handle any remaining rows after queue is empty
             if parser_row_count > 0 {
                 let batch = flush_parser(&mut parser, worker_schema.clone())?;
-                // Use a high index or the last processed index; sorting handles order
                 worker_batches.push((usize::MAX, batch));
             }
 
@@ -240,8 +240,6 @@ pub async fn run_db_logic(config: ConnectorConfig, blast_radius: i64) -> Result<
     if all_results.is_empty() { return Ok(RecordBatch::new_empty(arrow_schema)); }
 
     // Sort by task index to maintain relative order
-    // Note: With aggregation, strict row-to-partition mapping is blurred,
-    // but relative order of data is preserved.
     all_results.sort_by_key(|(index, _)| *index);
     let batches: Vec<RecordBatch> = all_results.into_iter().map(|(_, b)| b).collect();
     let final_batch = concat_batches(&arrow_schema, &batches)?;
@@ -249,11 +247,15 @@ pub async fn run_db_logic(config: ConnectorConfig, blast_radius: i64) -> Result<
     #[cfg(feature = "profiling")]
     drop(_p3_guard);
 
+    let duration_total = start_total.elapsed();
+
+    // --- REPORT ---
     println!("--- UncheckedIO Internal Timing ---");
-    println!("Phase 1 (Setup):   {:.2?}", start_phase2.duration_since(start_total) - duration_phase1);
+    // FIX: Using duration_phase1 correctly now
+    println!("Phase 1 (Setup):   {:.2?}", duration_phase1);
     println!("Phase 2 (Execute): {:.2?}", start_phase3.duration_since(start_phase2));
     println!("Phase 3 (Concat):  {:.2?}", start_phase3.elapsed());
-    println!("Total Wall Time:   {:.2?}", start_total.elapsed());
+    println!("Total Wall Time:   {:.2?}", duration_total);
 
     Ok(final_batch)
 }
@@ -500,5 +502,4 @@ fn read_string_field(
 }
 
 // Profiler logic omitted for brevity (it remains unchanged from previous version)
-// Note: You must keep the run_profiler_logic function in the file if it's called by lib.rs
 pub async fn run_profiler_logic(_: &str) -> Result<String> { Ok("Profiler Placeholder".to_string()) }
