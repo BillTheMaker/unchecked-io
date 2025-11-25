@@ -4,19 +4,34 @@ import sqlalchemy
 import connectorx as cx
 import unchecked_io
 import os
-import yaml # We need pyyaml for this
+import yaml
 import time
 
 # --- 1. Define Connection Strings and Query ---
-# These must match your local Docker setup
 DB_USER = "postgres"
 DB_PASS = "mysecretpassword"
 DB_HOST = "localhost"
-DB_PORT = "5433" # <-- Your local Docker port
+DB_PORT = "5433"
 DB_NAME = "postgres"
 
 # Global Configuration
-BLAST_RADIUS = 312500 # Rows per parallel task (1M / 62500 = 16 partitions)
+
+# Rows per parallel task (1M / 62500 = 16 partitions)
+
+#BLAST_RADIUS = 1250000 # 16 partitions
+
+#BLAST_RADIUS = 625000 # 32 partitions
+
+#BLAST_RADIUS = 312500 # 64 partitions
+
+#BLAST_RADIUS = 156250 # 128 partitions
+
+#BLAST_RADIUS = 125000 # 160 partitions
+
+#BLAST_RADIUS = 12500 # 1600 partitions
+
+BLAST_RADIUS = 1250 # 16000 partitions
+BATCH_SIZE = 262144    # Aggregation Size (Large Memory chunks)
 
 # SQLAlchemy connection string (for Pandas)
 sqlalchemy_conn_str = f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
@@ -35,6 +50,7 @@ unchecked_io_query = "COPY (SELECT id::BIGINT, uuid::TEXT, username::TEXT, score
 config_data = {
     'connection_string': connectorx_conn_str,
     'query': unchecked_io_query,
+    'batch_size': BATCH_SIZE, # <--- This explicitly writes your setting to the file
     'schema': [
         {'column_name': 'id', 'arrow_type': 'Int64'},
         {'column_name': 'uuid', 'arrow_type': 'Utf8'},
@@ -53,6 +69,8 @@ with open(config_file, 'w') as f:
     yaml.dump(config_data, f)
 
 print(f"UncheckedIO Config: {config_file} (dynamically created for local test)")
+print(f"  - Blast Radius: {BLAST_RADIUS}")
+print(f"  - Batch Size:   {BATCH_SIZE}")
 
 # --- 3. Define Benchmark Functions ---
 
@@ -73,14 +91,6 @@ def test_unchecked_io():
 # --- 4. Run Benchmarks ---
 run_count = 1
 print(f"Running benchmarks for 20,000,000 rows (average of {run_count} runs)...")
-print(f"Blast Radius: {BLAST_RADIUS} rows per task")
-
-# --- Pandas ---
-# print("\nRunning Pandas warmup...")
-# _ = test_pandas()
-# print("Timing pandas.read_sql...")
-# pandas_time = timeit.timeit(test_pandas, number=run_count) / run_count
-# print(f"Pandas Average Time: {pandas_time * 1000:.2f} ms")
 
 # --- ConnectorX ---
 print("\nRunning ConnectorX warmup...")

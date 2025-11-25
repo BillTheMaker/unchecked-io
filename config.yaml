@@ -1,3 +1,4 @@
+batch_size: 524288
 connection_string: postgresql://postgres:mysecretpassword@localhost:5433/postgres
 query: COPY (SELECT id::BIGINT, uuid::TEXT, username::TEXT, score::REAL, is_active::BOOLEAN,
   last_login::TIMESTAMP, notes::TEXT, course_id::INT, start_date::DATE, rating::FLOAT8

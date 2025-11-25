@@ -2,7 +2,7 @@
 name = "unchecked-io"
 version = "0.1.7"
 authors = ["Billthemaker"] # Replace with your name or alias
-license = "BSL-1" # Good practice for open-source
+license = "Apache-2.0" # Good practice for open-source
 edition = "2024"
 
 [lib] 
