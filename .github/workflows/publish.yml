@@ -18,6 +18,7 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64
+            python: '3.12'
           - os: macos-latest
             target: x86_64
           - os: windows-latest
@@ -42,7 +43,7 @@ jobs:
           # Use the target from the matrix (x86_64)
           target: ${{ matrix.target }}
           # Build a manylinux-compatible wheel for Linux/Colab users
-          manylinux: auto
+         # manylinux: auto
           command: build
           args: --release --out dist --find-interpreter
 
