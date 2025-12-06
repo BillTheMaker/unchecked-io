@@ -21,8 +21,10 @@ jobs:
             python: '3.12'
           - os: macos-latest
             target: x86_64
+            python: '3.12'
           - os: windows-latest
             target: x86_64
+            python: '3.12'
     
     steps:
       - uses: actions/checkout@v4
@@ -30,7 +32,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12' # Target a modern Python version
+          python-version: ${{ matrix.python }}
           
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -40,17 +42,15 @@ jobs:
       - name: Build wheels with Maturin
         uses: PyO3/maturin-action@v1
         with:
-          # Use the target from the matrix (x86_64)
           target: ${{ matrix.target }}
-          # Build a manylinux-compatible wheel for Linux/Colab users
-         # manylinux: auto
+          python: ${{ matrix.python }}
           command: build
           args: --release --out dist --find-interpreter
 
       - name: Upload built wheels as Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}-${{ matrix.target }} 
+          name: wheels-${{ matrix.os }}-${{ matrix.target }}
           path: dist
 
   publish:
@@ -63,14 +63,13 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: wheels
           path: dist
+          pattern: wheels-*
+          merge-multiple: true
           
       - name: Publish to PyPI
         uses: PyO3/maturin-action@v1
         with:
-          # Use the secret we configured on GitHub
           pypi-token: ${{ secrets.PYPI_API_TOKEN }}
-          # Command to upload all wheels in the 'dist' directory
           command: upload
           args: --skip-existing --non-interactive
