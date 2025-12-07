@@ -57,23 +57,28 @@ jobs:
 
     - name: Flatten and upload
       env:
-        PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}  # ← CORRECT TOKEN VAR
       run: |
         mkdir -p dist/flattened
-        rm -rf dist/flattened/*  # Clear
+        rm -rf dist/flattened/* 
         
-        # Copy EVERY wheel from EVERY subdir
+        # Copy EVERY wheel
         find dist -name "*.whl" | while read wheel; do
           cp "$wheel" dist/flattened/
         done
         
-        echo "=== TOTAL WHEELS (should be 9+) ==="
+        echo "=== TOTAL WHEELS ==="
         ls -la dist/flattened/*.whl | wc -l
         
         cd dist/flattened
         echo "=== UPLOADING $(ls *.whl | wc -l) WHEELS ==="
         ls -la *.whl | head -5
+        
+        # TWINE fallback (double protection)
+        export TWINE_USERNAME=__token__
+        export TWINE_PASSWORD=${{ secrets.PYPI_API_TOKEN }}
         maturin upload --skip-existing --non-interactive *.whl
+
 
 
 
