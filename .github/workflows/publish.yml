@@ -59,18 +59,21 @@ jobs:
       env:
         PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
       run: |
-        # CREATE flattened dir FIRST
         mkdir -p dist/flattened
+        rm -rf dist/flattened/*  # Clear
         
-        # Copy ALL wheels from ALL subdirs
-        find dist -name "*.whl" -exec cp {} dist/flattened/ \;
+        # Copy EVERY wheel from EVERY subdir
+        find dist -name "*.whl" | while read wheel; do
+          cp "$wheel" dist/flattened/
+        done
         
-        echo "=== ALL WHEELS FOUND ==="
-        ls -la dist/flattened/*.whl
+        echo "=== TOTAL WHEELS (should be 9+) ==="
+        ls -la dist/flattened/*.whl | wc -l
         
         cd dist/flattened
-        echo "=== UPLOADING FROM $(pwd) ==="
-        ls -la *.whl
-        maturin upload --skip-existing --non-interactive
+        echo "=== UPLOADING $(ls *.whl | wc -l) WHEELS ==="
+        ls -la *.whl | head -5
+        maturin upload --skip-existing --non-interactive *.whl
+
 
 
