@@ -73,7 +73,7 @@ jobs:
     - name: Publish to PyPI
       uses: PyO3/maturin-action@v1
       with:
-        pypi-token: ${{ secrets.PYPI_API_TOKEN }}
+        token: ${{ secrets.PYPI_API_TOKEN }}
         command: upload
         args: --skip-existing --non-interactive
 
