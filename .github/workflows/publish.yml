@@ -7,18 +7,13 @@ on:
   workflow_dispatch:
 
 jobs:
-  build_wheels:
-    name: Build wheels on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+  build_and_publish:
+    name: Build and Publish All Wheels
+    runs-on: ubuntu-latest
     strategy:
       matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64
-          - os: macos-latest
-            target: x86_64
-          - os: windows-latest
-            target: x86_64
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        target: [x86_64]
     
     steps:
       - uses: actions/checkout@v4
@@ -33,26 +28,26 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Build wheels with Maturin
+      - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
           command: build
           args: --release --out dist --find-interpreter
 
-      - name: Upload built wheels as Artifact
+      - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}-${{ matrix.target }}
-          path: dist
+          name: wheel-${{ matrix.os }}-${{ matrix.target }}
+          path: dist/*.whl
 
   publish:
-    name: Publish to PyPI
+    name: Publish All Wheels
+    needs: [build_and_publish]
     runs-on: ubuntu-latest
-    # NO NEEDS, NO IF - INDEPENDENT
 
     steps:
-    - name: Install maturin for upload
+    - name: Install maturin
       run: pip install maturin
 
     - name: Download ALL wheels
@@ -60,16 +55,12 @@ jobs:
       with:
         path: dist
 
-    - name: Flatten wheels to dist/
-      run: |
-        find dist -name "*.whl" -exec cp {} dist/ \;
-        echo "Wheels ready:"
-        ls -la dist/*.whl
-
-    - name: Publish to PyPI
+    - name: Flatten and upload
       env:
         PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
       run: |
-        cd dist
+        mkdir -p dist/flattened
+        find dist -name "*.whl" -exec cp {} dist/flattened/ \;
+        cd dist/flattened
         ls -la *.whl
         maturin upload --skip-existing --non-interactive
