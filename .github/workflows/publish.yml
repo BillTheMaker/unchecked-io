@@ -59,8 +59,13 @@ jobs:
       env:
         PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
       run: |
-        mkdir -p dist/flattened
+        # Find ALL wheels from ALL subdirectories
         find dist -name "*.whl" -exec cp {} dist/flattened/ \;
+        echo "Flattened wheels:"
+        ls -la dist/flattened/*.whl
+        
         cd dist/flattened
+        echo "Uploading from $(pwd):"
         ls -la *.whl
         maturin upload --skip-existing --non-interactive
+
