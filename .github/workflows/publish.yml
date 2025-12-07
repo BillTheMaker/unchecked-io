@@ -48,31 +48,31 @@ jobs:
           name: wheels-${{ matrix.os }}-${{ matrix.target }}
           path: dist
 
-    publish:
-      name: Publish to PyPI
-      needs: [build_wheels]
-      runs-on: ubuntu-latest
-      # REMOVED problematic if condition
+  publish:
+    name: Publish to PyPI
+    needs: [build_wheels]
+    runs-on: ubuntu-latest
+    # REMOVED problematic if condition
 
-      steps:
-      - name: Install maturin for upload
-        run: pip install maturin
+    steps:
+    - name: Install maturin for upload
+      run: pip install maturin
 
-      - name: Download ALL wheels
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
+    - name: Download ALL wheels
+      uses: actions/download-artifact@v4
+      with:
+        path: dist
 
-      - name: Flatten wheels to dist/
-        run: |
-          find dist -name "*.whl" -exec cp {} dist/ \;
-          echo "Wheels ready:"
-          ls -la dist/*.whl
+    - name: Flatten wheels to dist/
+      run: |
+        find dist -name "*.whl" -exec cp {} dist/ \;
+        echo "Wheels ready:"
+        ls -la dist/*.whl
 
-      - name: Publish to PyPI
-        env:
-          PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
-        run: |
-          cd dist
-          ls -la *.whl
-          maturin upload --skip-existing --non-interactive
+    - name: Publish to PyPI
+      env:
+        PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+      run: |
+        cd dist
+        ls -la *.whl
+        maturin upload --skip-existing --non-interactive
