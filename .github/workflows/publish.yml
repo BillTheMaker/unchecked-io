@@ -85,4 +85,11 @@ jobs:
         command: upload
         args: --skip-existing --non-interactive
 
+    - name: Publish to PyPI  # ← ADD THIS
+      uses: PyO3/maturin-action@v1
+      with:
+        token: ${{ secrets.PYPI_API_TOKEN }}
+        command: upload
+        args: --skip-existing --non-interactive
+
 
