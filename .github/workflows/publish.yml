@@ -10,8 +10,6 @@ jobs:
   build_wheels:
     name: Build wheels on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    # SPEED FIX: Skip on manual dispatch (use artifacts)
-    if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
     strategy:
       matrix:
         include:
@@ -50,9 +48,8 @@ jobs:
 
   publish:
     name: Publish to PyPI
-    needs: [build_wheels]
     runs-on: ubuntu-latest
-    # REMOVED problematic if condition
+    # NO NEEDS, NO IF - INDEPENDENT
 
     steps:
     - name: Install maturin for upload
