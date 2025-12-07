@@ -15,13 +15,10 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64
-            python: '3.12'
           - os: macos-latest
             target: x86_64
-            python: '3.12'
           - os: windows-latest
             target: x86_64
-            python: '3.12'
     
     steps:
       - uses: actions/checkout@v4
@@ -29,7 +26,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python }}
+          python-version: '3.12'
           
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -40,7 +37,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          python: ${{ matrix.python }}
+          # REMOVED: python (invalid input)
           command: build
           args: --release --out dist --find-interpreter
 
@@ -57,6 +54,10 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
 
     steps:
+    - name: Install maturin for upload
+      run: |
+        pip install maturin
+
     - name: Download ALL wheels
       uses: actions/download-artifact@v4
       with:
@@ -68,8 +69,8 @@ jobs:
         echo "Wheels ready:"
         ls -la dist/*.whl
 
-    - name: Publish from dist/
+    - name: Publish to PyPI
       run: |
         cd dist
-        ls -la *.whl  # Confirm wheels here
         maturin upload --token ${{ secrets.PYPI_API_TOKEN }} --skip-existing --non-interactive
+      shell: bash
