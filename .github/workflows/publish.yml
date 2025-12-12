@@ -9,7 +9,7 @@ on:
 jobs:
   build_and_publish:
     name: Build and Publish All Wheels
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
@@ -18,10 +18,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
+      # Only setup python for non-linux, or let maturin handle linux via docker
       - name: Set up Python
+        if: runner.os != 'Linux'
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.12' 
+          # Note: On Windows/Mac, to build for multiple python versions, 
+          # you usually need multiple setup-python steps or a matrix of python versions.
+          # But for now, let's at least get the artifacts downloading correctly.
+          # Ideally, you remove this and let maturin find python, but GitHub runners 
+          # might only have one default.
           
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -32,6 +39,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
+          manylinux: auto # This triggers the Docker container on Linux for multi-python builds
           command: build
           args: --release --out dist --find-interpreter
 
@@ -50,35 +58,19 @@ jobs:
     - name: Install maturin
       run: pip install maturin
 
+    # FIX: Use merge-multiple to flatten everything into 'dist' automatically
     - name: Download ALL wheels
       uses: actions/download-artifact@v4
       with:
         path: dist
+        pattern: wheel-*
+        merge-multiple: true
 
-    - name: Flatten and upload
+    - name: List Files (Debug)
+      run: ls -la dist
+
+    - name: Upload to PyPI
       env:
-        MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}  # ← CORRECT TOKEN VAR
+        MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
       run: |
-        mkdir -p dist/flattened
-        rm -rf dist/flattened/* 
-        
-        # Copy EVERY wheel
-        find dist -name "*.whl" | while read wheel; do
-          cp "$wheel" dist/flattened/
-        done
-        
-        echo "=== TOTAL WHEELS ==="
-        ls -la dist/flattened/*.whl | wc -l
-        
-        cd dist/flattened
-        echo "=== UPLOADING $(ls *.whl | wc -l) WHEELS ==="
-        ls -la *.whl | head -5
-        
-        # TWINE fallback (double protection)
-        export TWINE_USERNAME=__token__
-        export TWINE_PASSWORD=${{ secrets.PYPI_API_TOKEN }}
-        maturin upload --skip-existing --non-interactive *.whl
-
-
-
-
+        maturin upload --skip-existing --non-interactive dist/*
