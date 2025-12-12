@@ -4,7 +4,8 @@ build-backend = "maturin"
 
 [project]
 name = "unchecked-io"
-# Version is handled by Cargo.toml, but good practice to keep consistent if managing manually
+# Dynamic versioning allows maturin to read version from Cargo.toml
+dynamic = ["version"]
 description = "The world's fastest, most dangerous PostgreSQL-to-Arrow loader."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -13,19 +14,7 @@ authors = [{name = "Billthemaker"}]
 keywords = ["rust", "postgresql", "arrow", "etl", "fast", "copy", "database"]
 classifiers = [
     "Programming Language :: Rust",
-    "Programming Language :: Python :: Implementation :: CPython",
-    "Programming Language :: Python :: Implementation :: PyPy",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
-    "Topic :: Database",
-    "Topic :: Scientific/Engineering :: Information Analysis",
-    "Operating System :: POSIX :: Linux",
-    "Operating System :: Microsoft :: Windows",
-    "Operating System :: MacOS :: MacOS X",
 ]
 dependencies = [
     "arro3-core>=0.1.0",
@@ -33,5 +22,3 @@ dependencies = [
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
-
-
