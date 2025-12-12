@@ -4,8 +4,34 @@ build-backend = "maturin"
 
 [project]
 name = "unchecked-io"
-version = "0.1.0"
+# Version is handled by Cargo.toml, but good practice to keep consistent if managing manually
+description = "The world's fastest, most dangerous PostgreSQL-to-Arrow loader."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "BSL-1.1"}
+authors = [{name = "Billthemaker"}]
+keywords = ["rust", "postgresql", "arrow", "etl", "fast", "copy", "database"]
 classifiers = [
     "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: Implementation :: PyPy",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS :: MacOS X",
 ]
+dependencies = [
+    "arro3-core>=0.1.0",
+]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+
+
